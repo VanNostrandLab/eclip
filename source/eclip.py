@@ -11,6 +11,7 @@ import os
 import time
 import subprocess
 import json
+import yaml
 import datetime
 import sys
 import tempfile
@@ -79,143 +80,153 @@ parser.add_argument('--forced_tasks', metavar='TASKS', action="append", type=str
                     help='Task(s) which will be included even if they are up to date.')
 
 START_TIME = time.perf_counter()
-options = parser.parse_args()
-try:
-    with open(options.MANIFEST) as f:
-        manifest = json.load(f)
-except IOError:
-    raise ValueError(f'Manifest {options.MANIFEST} may not exist or not be file.')
-setattr(options, 'outdir', options.outdir or manifest.get('outdir', '') or os.getcwd())
-if not os.path.isdir(options.outdir):
+
+
+def parse_and_sanitize_options():
+    options = parser.parse_args()
     try:
-        os.mkdir(options.outdir)
-    except OSError:
-        raise OSError(f'Failed to create outdir {options.outdir}.')
-os.chdir(options.outdir)
-
-setattr(options, 'genome', options.genome or manifest.get('genome', ''))
-if not os.path.isdir(options.genome):
-    raise ValueError(f'Reference genome index {options.genome} is not a directory or does not exist.')
-
-setattr(options, 'repeat', options.repeat or manifest.get('repeat', ''))
-if not os.path.isdir(options.repeat):
-    raise ValueError(f'Repeat element index {options.repeat} is not a directory or does not exist.')
-
-setattr(options, 'dataset', manifest.get('dataset', 'eclip'))
-setattr(options, 'species', manifest.get('species', 'hg19'))
-setattr(options, 'track', options.dataset)
-setattr(options, 'track_label', options.dataset)
-setattr(options, 'track_genome', options.species)
-
-blacklist_bed = manifest.get('blacklist_bed', '')
-if blacklist_bed and not os.path.isfile(blacklist_bed):
-    raise ValueError(f'Blacklist bed {blacklist_bed} is not a file or does not exist.')
-else:
-    setattr(options, 'blacklist_bed', blacklist_bed)
-
-barcodes_fasta = manifest.get('barcodes_fasta', '')
-if barcodes_fasta:
-    if os.path.isfile(barcodes_fasta):
-        setattr(options, 'barcodes_fasta', barcodes_fasta)
-    else:
-        raise ValueError(f'Barcodes fasta {barcodes_fasta} is not a file or does not exist.')
-else:
-    setattr(options, 'barcodes_fasta', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'barcodes.fasta'))
-setattr(options, 'randomer_length', manifest.get('randomer_length', '5'))
-
-
-def validate_sample(i, sample):
-    ip_dict, input_dict = {}, {}
-    ip_read, input_read = sample.get('ip_read', {}), sample.get('input_read', {})
-    if not ip_read:
-        raise ValueError(f'Sample {i} does not have ip_read.')
-    if not input_read:
-        raise ValueError(f'Sample {i} does not have input_read.')
-    assert 'name' in ip_read and 'name' in input_read, ValueError('Missing name in ip_read and/or input_read.')
-    ip_dict['name'], input_dict['name'] = ip_read['name'], input_read['name']
-    ip_dict['type'], input_dict['type'] = 'ip', 'input'
-    ip_dict['link'] = f'eclip/{options.dataset}.{ip_read["name"]}'
-    input_dict['link'] = f'eclip/{options.dataset}.{input_read["name"]}'
-    ip_dict['link1'] = f'eclip/{options.dataset}.{ip_read["name"]}.r1.fastq.gz'
-    input_dict['link1'] = f'eclip/{options.dataset}.{input_read["name"]}.r1.fastq.gz'
+        with open(options.MANIFEST) as stream:
+            if options.MANIFEST.endswith('.json'):
+                manifest = json.load(stream)
+            elif options.MANIFEST.endswith('.yaml'):
+                manifest = yaml.safe_load(stream)
+            else:
+                raise ValueError(f'Unknown manifest file format, manifest filename needs to end with .yaml or .json.')
+    except IOError:
+        raise ValueError(f'Manifest {options.MANIFEST} may not exist or not be file.')
+    setattr(options, 'manifest', manifest)
+    setattr(options, 'outdir', options.outdir or manifest.get('outdir', '') or os.getcwd())
+    if not os.path.isdir(options.outdir):
+        try:
+            os.mkdir(options.outdir)
+        except OSError:
+            raise OSError(f'Outdir {options.outdir} does not exist and cannot be created!')
+    setattr(options, 'genome', options.genome or manifest.get('genome', ''))
+    if not os.path.isdir(options.genome):
+        raise ValueError(f'Reference genome index {options.genome} is not a directory or does not exist.')
     
-    if 'fastq' in ip_read:
-        read_type = 'single'
-        if not os.path.isfile(ip_read['fastq']):
-            raise ValueError(f'The ip_read fastq {ip_read["fastq"]} may not be a file or does not exist!')
-        assert 'fastq' in input_read, ValueError('Single-End sample input_read missing fastq.')
-        if not os.path.isfile(input_read['fastq']):
-            raise ValueError(f'The input_read fastq {input_read["fastq"]} may not be a file or does not exist!')
-        assert 'adapters' in ip_read and 'adapters' in input_read, ValueError('Single-End sample missing adapters.')
-        if not os.path.isfile(ip_read['adapters']):
-            raise ValueError(f'Adapters {ip_read["adapters"]} may not be a file or does not exist!')
+    setattr(options, 'repeat', options.repeat or manifest.get('repeat', ''))
+    if not os.path.isdir(options.repeat):
+        raise ValueError(f'Repeat element index {options.repeat} is not a directory or does not exist.')
+    
+    barcodes_fasta = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'barcodes.fasta')
+    setattr(options, 'barcodes_fasta', manifest.get('barcodes_fasta', '') or barcodes_fasta)
+    if not os.path.isfile(options.barcodes_fasta):
+        raise ValueError(f'Barcodes fasta {options.barcodes_fasta} is not a file or does not exist.')
+    setattr(options, 'randomer_length', manifest.get('randomer_length', '5'))
+    setattr(options, 'blacklist_bed', manifest.get('blacklist_bed', ''))
+    
+    setattr(options, 'dataset', manifest.get('dataset', 'eclip'))
+    setattr(options, 'species', manifest.get('species', 'hg19'))
+    setattr(options, 'track', options.dataset)
+    setattr(options, 'track_label', options.dataset)
+    setattr(options, 'track_genome', options.species)
+    
+    setattr(options, 'verbose', 3 if options.dry_run else 0)
+    setattr(options, 'jobs', options.cores)
+    setattr(options, 'multiprocess', options.cores)
+    setattr(options, 'use_threads', False)
+    setattr(options, 'just_print', options.dry_run)
+    setattr(options, 'verbose_abbreviated_path', options.verbose_path)
+    setattr(options, 'exceptions_terminate_immediately', True)
+    setattr(options, 'one_second_per_job', True)
+    setattr(options, 'log_exceptions', True)
+    return options
+
+
+options = parse_and_sanitize_options()
+os.chdir(options.outdir)
+ECLIP, HUB, QC = 'eclip', 'hub', 'qc'
+
+
+class Read:
+    def __init__(self, record, read_type):
+        self.type = read_type.upper()
+        self.name = record.get('name', '')
+        if not self.name:
+            raise KeyError(f'No name was assigned for {self.type}\nread {record}.')
+        self.fastq1 = record.get('fastq', '') or record.get('fastq1', '')
+        if self.fastq1:
+            if not os.path.isfile(self.fastq1):
+                raise ValueError(f'FASTQ1 {self.fastq1} may not be a file or does not exist.')
+        else:
+            raise KeyError(f'No fastq or fastq1 was assigned for {self.type} read\n{record}.')
+        self.fastq2 = record.get('fastq2', '')
+        if self.fastq2 and not os.path.isfile(self.fastq2):
+            raise ValueError(f'FASTQ2 {self.fastq2} may not be a file or does not exist.')
+        self.barcodes = record.get('barcodes', ['', ''])
+        self.adapters = record.get('adapters', '')
         
-        ip_dict['fastq1'], input_dict['fastq1'] = ip_read['fastq'], input_read['fastq']
-        ip_dict['fastq2'], input_dict['fastq2'] = '', ''
-        ip_dict['link2'], input_dict['link2'] = '', ''
-        ip_dict['adapters'], input_dict['adapters'] = ip_read['adapters'], input_read['adapters']
-        ip_dict['barcodes'], input_dict['barcodes'] = ['', ''], ['', '']
+        self.key = f'{options.dataset}.{self.name}'
+        self.paired = True if self.fastq2 else False
+        self.link1 = f'{ECLIP}/{self.key}.r1.fastq.gz'
+        self.link2 = f'{ECLIP}/{self.key}.r2.fastq.gz' if self.fastq2 else ''
+        self.bam = f'{ECLIP}/{self.key}.bam'
+        self.bed = f'{ECLIP}/{self.key}.peak.clusters.bed' if read_type == 'ip' else ''
+        self.full_bed = f'{ECLIP}/{self.key}.peak.clusters.full.bed' if read_type == 'ip' else ''
+        self.normalized_bed = f'{ECLIP}/{self.key}.peak.clusters.normalized.bed' if read_type == 'ip' else ''
+        self.compressed_bed = f'{ECLIP}/{self.key}.peak.clusters.compressed.bed' if read_type == 'ip' else ''
+
+
+class Sample:
+    def __init__(self, ip_read, input_read):
+        self.ip_read = Read(ip_read, 'ip')
+        self.input_read = Read(input_read, 'input')
+
+
+def size(file, formatting=True):
+    if os.path.isfile(file):
+        s = os.path.getsize(file)
+        if formatting:
+            if s < 1000:
+                s = f'[{s:.2f}B]'
+            elif s < 1000 * 1000:
+                s = f'[{s / 1000:.2f}KB]'
+            elif s < 1000 * 1000 * 1000:
+                s = f'[{s / 1000 / 1000:.2f}MB]'
+            else:
+                s = f'[{s / 1000 / 1000 / 1000:.2f}GB]'
     else:
-        read_type = 'paired'
-        assert 'fastq1' in ip_read and 'fastq2' in ip_read, ValueError('Paired-End sample ip_read missing '
-                                                                       'fastq1 and/or fastq2.')
-        if not os.path.isfile(ip_read['fastq1']):
-            raise ValueError(f'The ip_read fastq1 {ip_read["fastq1"]} may not be a file or does not exist!')
-        if not os.path.isfile(ip_read['fastq2']):
-            raise ValueError(f'The ip_read fastq2 {ip_read["fastq2"]} may not be a file or does not exist!')
-        
-        assert 'fastq1' in input_read and 'fastq2' in input_read, ValueError('Paired-End sample input_read missing '
-                                                                             'fastq1 and/or fastq2.')
-        if not os.path.isfile(input_read['fastq1']):
-            raise ValueError(f'The input_read fastq1 {input_read["fastq1"]} may not be a file or does not exist!')
-        if not os.path.isfile(input_read['fastq2']):
-            raise ValueError(f'The input_read fastq2 {input_read["fastq2"]} may not be a file or does not exist!')
-        
-        assert 'barcodes' in ip_read, ValueError('Paired-End sample in_read missing barcodes.')
-        assert 'barcodes' in input_read, ValueError('Paired-End sample input_read missing barcodes.')
-        ip_dict['link2'] = f'eclip/{options.dataset}.{ip_read["name"]}.r2.fastq.gz'
-        input_dict['link2'] = f'eclip/{options.dataset}.{input_read["name"]}.r2.fastq.gz'
-        ip_dict['fastq1'], input_dict['fastq1'] = ip_read['fastq1'], input_read['fastq1']
-        ip_dict['fastq2'], input_dict['fastq2'] = ip_read['fastq2'], input_read['fastq2']
-        ip_dict['adapters'], input_dict['adapters'] = '', ''
-        ip_dict['barcodes'], input_dict['barcodes'] = ip_read['barcodes'], input_read['barcodes']
-    return ip_dict, input_dict, read_type
+        s = '[?KB]' if formatting else 0
+    return s
 
 
-SAMPLES = manifest.get('samples', [])
-if not SAMPLES:
-    raise KeyError('Manifest file does not contain any samples.')
-FASTQS, SIZES, TYPE = {}, [], set()
-for i, sample in enumerate(SAMPLES, 1):
-    ips, inputs, read_type = validate_sample(i, sample)
-    TYPE.add(read_type)
-    ip_link, input_link = ips['link'], inputs['link']
-    if ip_link in FASTQS:
-        raise ValueError('Duplicated names found for ip_read.')
-    if input_link in FASTQS:
-        raise ValueError('Duplicated names found for input_read.')
-    FASTQS[ip_link], FASTQS[input_link] = ips, inputs
-    SIZES.extend([os.path.getsize(ips['fastq1']), os.path.getsize(inputs['fastq1'])])
-    if ips['fastq2']:
-        SIZES.extend([os.path.getsize(ips['fastq2']), os.path.getsize(inputs['fastq2'])])
-        
-assert len(TYPE) == 1, ValueError('Manifest mixed with single-end and paired-end fastq file specification.')
-TYPE = list(TYPE)[0]
+def parse_and_validate_samples():
+    def estimate_max_processes():
+        max_size = max(sizes) / (1000 * 1000 * 1000) * 5
+        n = int(options.memory / max_size)
+        if n == 0:
+            n = 1
+        elif n > options.cores:
+            n = options.cores
+        return n
+    
+    samples, reads, sizes, types = [], {}, [], []
+    for sample in options.manifest.get('samples', []):
+        ip_read, input_read = sample.get('ip_read', {}), sample.get('input_read', {})
+        if not ip_read:
+            raise KeyError(f'No key ip_read was found in sample\n{sample}.')
+        if not input_read:
+            raise KeyError('No key input_read was found in sample\n{sample}.')
+        ip_read, input_read = Read(ip_read, 'ip'), Read(input_read, 'input')
+        if ip_read.key in samples:
+            raise ValueError(f'Duplicated names found for ip_read\n{ip_read}.')
+        if input_read.key in samples:
+            raise ValueError(f'Duplicated names found for input_read\n{input_read}.')
+        samples.extend([ip_read, input_read])
+        reads[ip_read.key], reads[input_read.key] = ip_read, input_read
+        sizes.extend([size(ip_read.fastq1, formatting=False), size(ip_read.fastq2, formatting=False),
+                      size(input_read.fastq1, formatting=False), size(input_read.fastq2, formatting=False)])
+        types.extend([ip_read.paired, input_read.paired])
+    if not samples:
+        raise KeyError('Manifest file misses key samples or does not contain any samples.')
+    assert len(set(types)) == 1, ValueError('Reads mixed with single-end and paired-end fastq file specifications.')
+    return samples, reads, estimate_max_processes(), 'paired' if types[0] else 'single'
 
-VERBOSE = options.verbose
-setattr(options, 'verbose', 3 if options.dry_run else 0)
-setattr(options, 'jobs', options.cores)
-setattr(options, 'multiprocess', options.cores)
-setattr(options, 'use_threads', False)
-setattr(options, 'just_print', options.dry_run)
-setattr(options, 'verbose_abbreviated_path', options.verbose_path)
-setattr(options, 'exceptions_terminate_immediately', True)
-setattr(options, 'one_second_per_job', True)
-setattr(options, 'log_exceptions', True)
-setattr(options, 'logger', ruffus.black_hole_logger)
 
+SAMPLES, READS, PROCESSES, TYPE = parse_and_validate_samples()
 VERSION = 1.0
-logo = fr"""
+HEADER = fr"""
                            ____   _       ___   ____
                     ___   / ___| | |     |_ _| |  _ \
                    / _ \ | |     | |      | |  | |_) |
@@ -277,7 +288,6 @@ def cmding(cmd, **kwargs):
                 else:
                     m = f'{m / 1000 / 1000:.2f}GB'
                 s = f'{t} {m}'
-            os.unlink(profile_output)
         except FileNotFoundError:
             s = '00:00:00 0.00KB'
         return s
@@ -289,35 +299,23 @@ def cmding(cmd, **kwargs):
     logger.debug(cmd)
     cwd = kwargs.pop('cwd', options.outdir)
     profile_output = tempfile.mktemp(suffix='.txt', prefix='.profile.', dir=cwd)
-    cmd = f'time -f "%E %M" -o {profile_output} {cmd}'
-    process = subprocess.Popen(cmd, universal_newlines=True, shell=True, cwd=cwd,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
-    stdout, stderr = process.communicate()
-    if process.returncode:
-        logger.error(f'Failed to run {program} (exit code {process.returncode}):\n{stderr or stdout}')
-        sys.exit(process.returncode)
-    if message:
-        logger.info(message.replace(' ...', f' complete [{parse_profile()}].'))
-
-
-def estimate_process():
-    """Estimate number of processes based on the maximum size of fastq file."""
-    
-    size = max(SIZES) / (1000 * 1000 * 1000) * 10
-    n = int(options.memory / size)
-    if n == 0:
-        n = 1
-    elif n > options.cores:
-        n = options.cores
-    return n
-
-
-PROCESS = estimate_process()
+    try:
+        cmd = f'time -f "%E %M" -o {profile_output} {cmd}'
+        process = subprocess.Popen(cmd, universal_newlines=True, shell=True, cwd=cwd,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+        stdout, stderr = process.communicate()
+        if process.returncode:
+            logger.error(f'Failed to run {program} (exit code {process.returncode}):\n{stderr or stdout}')
+            sys.exit(process.returncode)
+        if message:
+            logger.info(message.replace(' ...', f' complete [{parse_profile()}].'))
+    finally:
+        os.unlink(profile_output)
 
 
 @ruffus.jobs_limit(1)
-@ruffus.follows(ruffus.mkdir('eclip'))
-@ruffus.originate([v['link1'] for v in FASTQS.values()])
+@ruffus.follows(ruffus.mkdir(ECLIP))
+@ruffus.originate([read.link1 for read in READS.values()])
 def soft_link(link1):
     """ Create soft links for original fastq files. """
     
@@ -331,49 +329,49 @@ def soft_link(link1):
                     message = f'Soft link fastq: {os.path.basename(path)} ...'
                     cmding(f'ln -s {path} {link}', message=message)
                     
-    read = FASTQS[link1.replace('.r1.fastq.gz', '')]
-    link1, link2 = read['link1'], read['link2']
-    make_link(read['fastq1'], link1)
+    read = READS[os.path.basename(link1.replace('.r1.fastq.gz', ''))]
+    link1, link2 = read.link1, read.link2
+    make_link(read.fastq1, link1)
     if link2:
-        make_link(read['fastq2'], link2)
+        make_link(read.fastq2, link2)
 
 
 def cleanup_demux():
     fastq, rm = set(), [options.dataset]
-    for link, read in FASTQS.items():
-        name, barcodes = read['name'], read['barcodes']
-        if read['link2']:
-            fastq.add(f'eclip/{options.dataset}.{name}.{barcodes[0]}.r1.fq.gz')
-            fastq.add(f'eclip/{options.dataset}.{name}.{barcodes[0]}.r2.fq.gz')
-            fastq.add(f'eclip/{options.dataset}.{name}.{barcodes[1]}.r1.fq.gz')
-            fastq.add(f'eclip/{options.dataset}.{name}.{barcodes[1]}.r2.fq.gz')
-            rm.extend([name] + barcodes)
+    for key, read in READS.items():
+        if read.link2:
+            fastq.add(f'{ECLIP}/{read.key}.{read.barcodes[0]}.r1.fq.gz')
+            fastq.add(f'{ECLIP}/{read.key}.{read.barcodes[0]}.r2.fq.gz')
+            fastq.add(f'{ECLIP}/{read.key}.{read.barcodes[1]}.r1.fq.gz')
+            fastq.add(f'{ECLIP}/{read.key}.{read.barcodes[1]}.r2.fq.gz')
+            rm.append(read.name)
+            rm.extend(read.barcodes)
         else:
-            fastq.add(f'eclip/{options.dataset}.{name}.umi.r1.fq.gz')
-    rm = [os.path.join('eclip', r) for r in rm] + [x for x in glob.iglob('eclip/*.fq.gz') if x not in fastq]
+            fastq.add(f'{ECLIP}/{read.key}.umi.r1.fq.gz')
+    rm = [os.path.join(ECLIP, r) for r in rm] + [x for x in glob.iglob(f'{ECLIP}/*.fq.gz') if x not in fastq]
     _ = [os.unlink(x) for x in rm if os.path.isfile(x)]
 
 
-@ruffus.jobs_limit(PROCESS)
+@ruffus.jobs_limit(PROCESSES)
 @ruffus.posttask(cleanup_demux)
 @ruffus.transform(soft_link, ruffus.suffix('.fastq.gz'), '.prepare.done')
 def prepare_reads(link, output):
     """Extract UMIs for single-end reads or demultiplex paired-end reads."""
-    read = FASTQS[link.replace('.r1.fastq.gz', '')]
-    fastq1, fastq2 = read['link1'], read['link2']
+    read = READS[os.path.basename(link.replace('.r1.fastq.gz', ''))]
+    fastq1, fastq2 = read.link1, read.link2
     if fastq2:
-        barcodes, cwd = read['barcodes'], os.path.join(options.outdir, 'eclip')
+        barcodes, cwd = read.barcodes, os.path.join(options.outdir, 'eclip')
         message = f'Demultiplexing paired-end reads {fastq1} {size(fastq1)} and\n{" " * 43}{fastq2} {size(fastq2)} ...'
         cmd = ['demux',
                '--fastq_1', os.path.basename(fastq1),
                '--fastq_2', os.path.basename(fastq2),
-               '--newname', read['name'],
+               '--newname', read.name,
                '--expectedbarcodeida', barcodes[0],
                '--expectedbarcodeidb', barcodes[1],
                '--dataset', options.dataset,
                '--barcodesfile', options.barcodes_fasta,
                '--length', options.randomer_length,
-               '--metrics', f'{options.dataset}.{read["name"]}.demux.metrics']
+               '--metrics', f'{options.dataset}.{read.name}.demux.metrics']
         cmding(cmd, message=message, cwd=cwd)
     else:
         message = f'Extract UMIs for single-end read {fastq1} {size(fastq1)} ...'
@@ -391,30 +389,14 @@ def prepare_reads(link, output):
 
 def prepare_adapter_cut():
     fastq = set()
-    for link, read in FASTQS.items():
-        name, barcodes = read['name'], read['barcodes']
+    for key, read in READS.items():
+        name, barcodes = read.name, read.barcodes
         if TYPE == 'paired':
-            fastq.add(f'eclip/{options.dataset}.{name}.{barcodes[0]}.r1.clean.fastq')
-            fastq.add(f'eclip/{options.dataset}.{name}.{barcodes[1]}.r1.clean.fastq')
+            fastq.add(f'{ECLIP}/{key}.{barcodes[0]}.r1.clean.fastq')
+            fastq.add(f'{ECLIP}/{key}.{barcodes[1]}.r1.clean.fastq')
         else:
-            fastq.add(f'eclip/{options.dataset}.{name}.umi.r1.clean.fastq')
+            fastq.add(f'{ECLIP}/{key}.umi.r1.clean.fastq')
     return fastq
-
-
-def size(file):
-    if os.path.isfile(file):
-        s = os.path.getsize(file)
-        if s < 1000:
-            s = f'[{s:.2f}B]'
-        elif s < 1000 * 1000:
-            s = f'[{s / 1000:.2f}KB]'
-        elif s < 1000 * 1000 * 1000:
-            s = f'[{s / 1000 / 1000:.2f}MB]'
-        else:
-            s = f'[{s / 1000 / 1000 / 1000:.2f}GB]'
-    else:
-        s = '[?KB]'
-    return s
 
 
 @ruffus.jobs_limit(1)
@@ -434,17 +416,15 @@ def cut_adapt(fastq):
             return f.read().strip()
     
     def get_adapters(read):
-        adapter, adapters = read['adapters'], []
+        adapter, adapters = read.adapters, []
         if adapter:
             adapters1 = parse_adapters('-a', adapter)
             adapters2 = adapters1
             overlap1, overlap2 = '1', '5'
         else:
-            env = os.environ.copy()
-            env['PATH'] = f'{os.path.dirname(os.path.abspath(__file__))}:{env["PATH"]}'
-            cmd = ['parse_barcodes.sh', options.randomer_length, options.barcodes_fasta] + read['barcodes']
+            cmd = ['parse_barcodes.sh', options.randomer_length, options.barcodes_fasta] + read.barcodes
             folder = tempfile.mkdtemp(dir=os.path.join(options.outdir, 'eclip'))
-            cmding(cmd, message='Parsing barcodes and finding adapters ...', cwd=folder, env=env)
+            cmding(cmd, message='Parsing barcodes and finding adapters ...', cwd=folder)
             adapters = parse_adapters('-a', os.path.join(folder, 'a_adapters.fasta'))
             adapters += parse_adapters('-A', os.path.join(folder, 'A_adapters.fasta'))
             adapters += parse_adapters('-g', os.path.join(folder, 'g_adapters.fasta'))
@@ -457,34 +437,28 @@ def cut_adapt(fastq):
     
     def get_ios(out1):
         if '.umi.' in out1:
+            input11, input12 = out1.replace('.clean.', '.').replace('.fastq', '.fq.gz'), ''
             ios1 = ['-o', out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz'),
-                    out1.replace('.clean.', '.').replace('.fastq', '.fq.gz'),
-                    '>', out1.replace('.r1.clean.fastq', '.trim.metrics')]
-            msg1 = (f"Cutting adapters for single read {out1.replace('.clean.', '.')} "
-                    f"{size(out1.replace('.clean.', '.'))} (first round) ...")
-            ios2 = ['-o', out1,
-                    out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz'),
-                    '>', out1.replace('.r1.clean.fastq', '.clean.metrics')]
-            msg2 = (f"Cutting adapters for single read {out1.replace('.clean.', '.trim.')} "
-                    f"{size({out1.replace('.clean.', '.trim.')})} (second round) ...")
+                    input11, '>', out1.replace('.r1.clean.fastq', '.trim.metrics')]
+            msg1 = f"Cutting adapters for single read {out1.replace('.clean.', '.')} {{s1}} (first round) ..."
+            input21, input22 = out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz'), ''
+            ios2 = ['-o', out1, input21, '>', out1.replace('.r1.clean.fastq', '.clean.metrics')]
+            msg2 = f"Cutting adapters for single read {out1.replace('.clean.', '.trim.')} {{s1}} (second round) ..."
         else:
+            input11 = out1.replace('.clean.', '.').replace('.fastq', '.fq.gz')
+            input12 = out1.replace('.clean.', '.').replace('.fastq', '.fq.gz').replace('.r1.', '.r2.')
             ios1 = ['-o', out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz'),
                     '-p', out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz').replace('.r1.', '.r2.'),
-                    out1.replace('.clean.', '.').replace('.fastq', '.fq.gz'),
-                    out1.replace('.clean.', '.').replace('.fastq', '.fq.gz').replace('.r1.', '.r2.'),
-                    '>', out1.replace('.r1.clean.fastq', '.trim.metrics')]
-            msg1 = (f"Cutting adapters for paired reads {out1.replace('.clean.', '.')} and\n{' ' * 45}"
-                    f"{out1.replace('.clean.', '.').replace('.r1.', '.r2.')} "
-                    f"{size({out1.replace('.clean.', '.').replace('.r1.', '.r2.')})} (first round) ...")
+                    input11, input12, '>', out1.replace('.r1.clean.fastq', '.trim.metrics')]
+            msg1 = (f"Cutting adapters for paired reads {out1.replace('.clean.', '.')} {{s1}} and\n{' ' * 45}"
+                    f"{out1.replace('.clean.', '.').replace('.r1.', '.r2.')} {{s2}} (first round) ...")
+            input21 = out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz')
+            input22 = out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz').replace('.r1.', '.r2.')
             ios2 = ['-o', out1, '-p', out1.replace('.r1.', '.r2.'),
-                    out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz'),
-                    out1.replace('.clean.', '.trim.').replace('.fastq', '.fastq.gz').replace('.r1.', '.r2.'),
-                    '>', out1.replace('.r1.clean.fastq', '.clean.metrics')]
-            msg2 = (f"Cutting adapters for paired reads {out1.replace('.clean.', '.trim.')} "
-                    f"{size(out1.replace('.clean.', '.trim.'))} and\n{' ' * 45}"
-                    f"{out1.replace('.clean.', '.trim.').replace('.r1.', '.r2.')} "
-                    f"{size(out1.replace('.clean.', '.trim.').replace('.r1.', '.r2.'))} (second round) ...")
-        return ios1, ios2, msg1, msg2
+                    input21, input22, '>', out1.replace('.r1.clean.fastq', '.clean.metrics')]
+            msg2 = (f"Cutting adapters for paired reads {out1.replace('.clean.', '.trim.')} {{s1}} and\n{' ' * 45}"
+                    f"{out1.replace('.clean.', '.trim.').replace('.r1.', '.r2.')} {{s2}} (second round) ...")
+        return ios1, ios2, msg1, msg2, input11, input12, input21, input22
     
     def trim_adapters(adapters, overlap, ios, message):
         cmd = ['cutadapt', '-O', overlap, '--times', '2', '-e', '0.0', '-j', options.cores, '-m', '18',
@@ -492,15 +466,15 @@ def cut_adapt(fastq):
         cmding(cmd, message=message)
     
     link = '.'.join(fastq.split('.')[:-4])
-    read = FASTQS[link]
+    read = READS[os.path.basename(link)]
     adapters1, adapters2, overlap1, overlap2 = get_adapters(read)
-    ios1, ios2, msg1, msg2 = get_ios(fastq)
-    trim_adapters(adapters1, overlap1, ios1, msg1)
-    trim_adapters(adapters2, overlap2, ios2, msg2)
-    cmding('rm eclip/*.trim.fastq.gz')
+    ios1, ios2, msg1, msg2, input11, input12, input21, input22 = get_ios(fastq)
+    trim_adapters(adapters1, overlap1, ios1, msg1.format(s1=size(input11), s2=size(input12)))
+    trim_adapters(adapters2, overlap2, ios2, msg2.format(s1=size(input21), s2=size(input22)))
+    cmding(f'rm {ECLIP}/*.trim.fastq.gz')
 
 
-@ruffus.jobs_limit(PROCESS)
+@ruffus.jobs_limit(PROCESSES)
 @ruffus.transform(cut_adapt, ruffus.suffix('.clean.fastq'), '.clean.sort.fastq')
 def sort_fastq(fastq, output):
     cmd = ['fastq-sort', '--id', fastq, '>', output]
@@ -514,10 +488,10 @@ def sort_fastq(fastq, output):
 
 
 @ruffus.jobs_limit(1)
-@ruffus.follows(ruffus.mkdir('eclip/repeat.elements.map'))
+@ruffus.follows(ruffus.mkdir(f'{ECLIP}/repeat.elements.map'))
 @ruffus.transform(sort_fastq,
                   ruffus.formatter(r'.+/(?P<BASENAME>.*).r1.clean.sort.fastq'),
-                  'eclip/repeat.elements.map/{BASENAME[0]}/Unmapped.out.mate1')
+                  ECLIP + '/repeat.elements.map/{BASENAME[0]}/Unmapped.out.mate1')
 def map_to_repeat_elements(fastq, mate1):
     fastq1, fastq2 = fastq, fastq.replace('.r1.clean.sort.fastq', '.r2.clean.sort.fastq')
     prefix = os.path.dirname(mate1)
@@ -552,7 +526,7 @@ def map_to_repeat_elements(fastq, mate1):
     cmding(cmd, message=message)
 
 
-@ruffus.jobs_limit(PROCESS)
+@ruffus.jobs_limit(PROCESSES)
 @ruffus.transform(map_to_repeat_elements, ruffus.suffix('.out.mate1'), '.out.mate1.sort.fastq')
 def sort_mate(mate1, output):
     cmd = ['fastq-sort', '--id', mate1, '>', output]
@@ -566,10 +540,10 @@ def sort_mate(mate1, output):
 
 
 @ruffus.jobs_limit(1)
-@ruffus.follows(ruffus.mkdir('eclip/reference.genome.map'))
+@ruffus.follows(ruffus.mkdir(ECLIP + '/reference.genome.map'))
 @ruffus.transform(sort_mate,
                   ruffus.formatter(r'.+/Unmapped.out.mate1.sort.fastq'),
-                  'eclip/reference.genome.map/{subdir[0][0]}/Aligned.out.bam')
+                  ECLIP + '/reference.genome.map/{subdir[0][0]}/Aligned.out.bam')
 def map_to_reference_genome(mate1, bam):
     # '--outSAMunmapped' flag needs to be set to 'Within', otherwise barcode_collapse.py for duplication removal will 
     # throw out name not match error.
@@ -606,12 +580,12 @@ def map_to_reference_genome(mate1, bam):
 
 
 def name_sort_bam(bam, out):
-    cmding(f'samtools sort -n -@ {options.cores} -m {min(4, int(options.memory / PROCESS))}G -o {out} {bam}',
+    cmding(f'samtools sort -n -@ {options.cores} -m {min(4, int(options.memory / PROCESSES))}G -o {out} {bam}',
            message=f'Name sorting {bam} {size(bam)} ...')
 
 
 def position_sort_bam(bam, out):
-    cmding(f'samtools sort -@ {options.cores} -m {min(4, int(options.memory / PROCESS))}G -o {out} {bam}',
+    cmding(f'samtools sort -@ {options.cores} -m {min(4, int(options.memory / PROCESSES))}G -o {out} {bam}',
            message=f'Sorting {bam} {size(bam)} ...')
     
     
@@ -621,8 +595,8 @@ def index_sorted_bam(bam):
 
 def merge_paired_bam(bam, out):
     if not os.path.exists(out):
-        link = out.replace(".merge.bam", "")
-        barcodes = FASTQS[link]['barcodes']
+        key = out.replace(".merge.bam", "")
+        barcodes = READS[os.path.basename(key)].barcodes
         if barcodes[0] == 'NIL':
             cmding(f'mv {bam} {out}')
         else:
@@ -631,13 +605,12 @@ def merge_paired_bam(bam, out):
                 b1, b2 = bam, bam.replace(b1, b2)
             else:
                 b1, b2 = bam.replace(b2, b1), bam
-            message = f'Merging {b1} {size(b1)} and {b2} {size(b2)} ...'
-            cmding(f'samtools merge -@ {options.cores} -m {min(4, int(options.memory / PROCESS))}G {out} {b1} {b2}',
-                   message=message)
+            cmding(f'samtools merge -@ {options.cores} {out} {b1} {b2}',
+                   message=f'Merging {b1} {size(b1)} and {b2} {size(b2)} ...')
 
 
 @ruffus.jobs_limit(1)
-@ruffus.transform(map_to_reference_genome, ruffus.formatter(r'.+/Aligned.out.bam'), 'eclip/{subdir[0][0]}.sort.bam')
+@ruffus.transform(map_to_reference_genome, ruffus.formatter(r'.+/Aligned.out.bam'), ECLIP + '/{subdir[0][0]}.sort.bam')
 def prepare_bam(bam, out):
     if TYPE == 'single':
         name_sort = out.replace('.sort.bam', '.name.sort.bam')
@@ -649,23 +622,21 @@ def prepare_bam(bam, out):
         name_sort_bam(bam, out)
 
 
-@ruffus.jobs_limit(PROCESS)
+@ruffus.jobs_limit(PROCESSES)
 @ruffus.transform(prepare_bam, ruffus.suffix('.sort.bam'), '.sort.dedup.bam')
 def dedup_bam(bam, out):
     """Collapse barcodes of paired-end bam or umi_tools dedup single-end bam."""
-    # env = os.environ.copy()
     if TYPE == 'single':
         cmd = ['umi_tools', 'dedup', '--random-seed', 1, '--stdin', bam, '--method', 'unique',
                '--output-stats', out.replace(".dedup.bam", ".dedup.metrics"), '--stdout', out]
         message = f'Deduplicating {bam} {size(bam)} by umi_tools dedup ...'
     else:
-        # env['PATH'] = f'{os.path.dirname(os.path.abspath(__file__))}:{env["PATH"]}'
         cmd = f'barcode_collapse.py -o {out} -m {out.replace(".bam", ".collapse.metrics")} -b {bam}'
         message = f'Deduplicating {bam} {size(bam)} by collapsing barcodes ...'
-    # cmding(cmd, message=message, env=env)
     cmding(cmd, message=message)
 
 
+@ruffus.jobs_limit(1)
 @ruffus.transform(dedup_bam, ruffus.suffix('.sort.dedup.bam'), '.sort.dedup.sort.bam')
 def sort_bam(bam, out):
     position_sort_bam(bam, out)
@@ -685,21 +656,21 @@ def merge_bam(bam, out):
 def index_bam(bam, out):
     if TYPE == 'paired':
         cmding(f'samtools view -f 128 -@ {options.cores} -b -o {out} {bam}',
-               message='Extracting r2 reads from {bam} {size(bam)} ...')
+               message=f'Extracting r2 reads from {bam} {size(bam)} ...')
     else:
         cmding(f'mv {bam} {out}')
     if not os.path.exists(f'{bam}.bai'):
         index_sorted_bam(out)
         
 
-@ruffus.jobs_limit(PROCESS)
+@ruffus.jobs_limit(PROCESSES)
 @ruffus.follows(ruffus.mkdir('hub'))
 @ruffus.follows(index_bam)
-@ruffus.transform([f'{link}.bam' for link in FASTQS],
-                  ruffus.formatter(r'.+/(?P<BASENAME>.*).bam'), 'hub/{BASENAME[0]}.plus.bw')
+@ruffus.transform([read.bam for read in READS.values()],
+                  ruffus.formatter(r'.+/(?P<BASENAME>.*).bam'), HUB + '/{BASENAME[0]}.plus.bw')
 def make_bigwig_files(bam, bigwig):
     def bam_to_bigwig(bam, scale, strand, bw):
-        bg, bg_sort = f'{bw[:-3]}.bg', f'{bw[:-3]}.sort.bg'
+        bg, bg_sort = f'{bw[:-3]}.sort.bg', f'{bw[:-3]}.bg'
         cmd = f'genomeCoverageBed -ibam {bam} -bg -scale {scale} -strand {strand} -du -split > {bg}'
         cmding(cmd, message=f'Calculating genome coverage for {bam} {size(bam)} ...')
         cmd = f'bedSort {bg} {bg_sort}'
@@ -711,19 +682,17 @@ def make_bigwig_files(bam, bigwig):
     if not os.path.exists(bigwig):
         message, start_time = f'Make BigWig files for {bam} ...', time.perf_counter()
         logger.info(message)
-        link = bigwig.replace('.plus.bw', '').replace('hub/', 'eclip/')
-        read_type = 'paired' if FASTQS[link]['link2'] else 'single'
         pos_bw, neg_bw = bigwig, bigwig.replace('.plus.bw', '.minus.bw')
         with pysam.AlignmentFile(bam, 'rb') as sam:
             total_reads = sam.mapped
-        total_reads = total_reads if read_type == 'single' else total_reads / 2
+        total_reads = total_reads if TYPE == 'single' else total_reads / 2
         if total_reads:
             scale = 1000000.0 / total_reads
         else:
             logger.error(f'No reads was found in BAM {bam}')
             ruffus.touch_file(bigwig)
             return
-        if read_type == 'single':
+        if TYPE == 'single':
             bam_to_bigwig(bam, scale, '+', pos_bw)
             bam_to_bigwig(bam, -1 * scale, '-', neg_bw)
         else:
@@ -734,7 +703,7 @@ def make_bigwig_files(bam, bigwig):
         logger.info(message)
 
 
-@ruffus.merge(make_bigwig_files, 'hub/hub.txt')
+@ruffus.merge(make_bigwig_files, HUB + 'hub.txt')
 def make_hub_files(inputs, output):
     message, start_time = 'Make hub track file ...', time.perf_counter()
     logger.info(message)
@@ -797,34 +766,24 @@ container multiWig
     logger.info(message)
 
 
-@ruffus.jobs_limit(PROCESS)
+@ruffus.jobs_limit(PROCESSES)
 @ruffus.follows(make_hub_files)
-@ruffus.transform([f'{k}.bam' for k, v in FASTQS.items() if v['type'] == 'ip'],
+@ruffus.transform([read.bam for read in READS.values() if read.type == 'IP'],
                   ruffus.suffix('.bam'), '.peak.clusters.bed')
 def clipper(bam, bed):
     cmd = f'clipper --species {options.species} --bam {bam} --outfile {bed}'
     cmding(cmd, message=f'Calling peaks from {bam} {size(bam)} ...')
 
 
-@ruffus.jobs_limit(PROCESS)
+@ruffus.jobs_limit(PROCESSES)
 @ruffus.transform(clipper, ruffus.suffix('.peak.clusters.bed'), '.peak.clusters.normalized.bed')
 def overlap_peaks(peak, norm_peak):
-    def peak_to_bams(peak):
-        for sample in SAMPLES:
-            ip_name = [s['name'] for s in sample if 'ip_read' in s][0]
-            input_name = [s['name'] for s in sample if 'input_read' in s][0]
-            ip_bam = f'eclip/{options.dataset}.{ip_name}.bam'
-            input_bam = f'eclip/{options.dataset}.{input_name}.bam'
-            if peak == f'eclip/{options.dataset}.{ip_name}.peak.clusters.bed':
-                return ip_bam, input_bam
-        else:
-            raise ValueError(f'Failed to find corresponding bam files for {peak}.')
-        
     def mapped_read_number(bam):
         cmd = f'samtools view -c -F 4 -o {bam}.mapped.read.number {bam}'
         cmding(cmd, message=f'Counting mapped read number of {bam} {size(bam)} ...')
         
-    ip_bam, input_bam = peak_to_bams(peak)
+    ip_bam, input_bam = [(ip_read.bam, input_read.bam) for (ip_read, input_read) in SAMPLES
+                         if ip_read.bed == peak][0]
     ip_count, input_count = mapped_read_number(ip_bam), mapped_read_number(input_bam)
     cmd = ['overlap_peak.pl', ip_bam, input_bam, peak, ip_count, input_count, norm_peak]
     cmding(cmd, message=f'Normalizing peaks in {peak} {size(peak)} ...')
@@ -839,48 +798,50 @@ def compress_peaks():
     pass
 
 
-# def cleanup():
-#     logger.info('Deleting soft links ...')
-#     cmding('rm fastq_to_bam/*.fastq.gz')
-#     logger.info('Deleting fastq files ...')
-#     cmding('rm fastq_to_bam/*.clean.fastq')
-#     logger.info('Compressing sorted fastq files ...')
-#     for fastq in glob.iglob('fastq_to_bam/*.clean.sort.fastq'):
-#         cmding(f'pigz -p 8 {fastq}')
-#     logger.info('Compressing sorted mate files ...')
-#     for mate in glob.iglob('fastq_to_bam/repeat.elements.map/*/Unmapped.out.mate1'):
-#         sample = os.path.basename(os.path.dirname(mate))
-#         cmding(f'pigz -p 8 -c {mate} > fastq_to_bam/{sample}.mate1.sort.fastq.gz')
-#     for mate in glob.iglob('fastq_to_bam/repeat.elements.map/*/Unmapped.out.mate2'):
-#         sample = os.path.basename(os.path.dirname(mate))
-#         cmding(f'pigz -p 8 -c {mate} > fastq_to_bam/{sample}.mate2.sort.fastq.gz')
-#     logger.info('Deleting map directories ...')
-#     cmding('rm -rf fastq_to_bam/repeat.elements.map fastq_to_bam/reference.genome.map')
-#     logger.info('Deleting rMATS temporary directory ...')
-#     cmding('rm alternative_splicing/rmats.summary.txt')
-#     cmding('rm -rf alternative_splicing/tmp')
+def cleanup():
+    logger.info('Deleting soft links ...')
+    cmding(f'rm {ECLIP}/*.fastq.gz')
+    logger.info(f'Deleting {"UMI extract" if TYPE == "single" else "barcodes demultiplex"} files ...')
+    cmding(f'rm {ECLIP}/*.fq.gz {ECLIP}/*.prepare.done')
+    logger.info('Deleting cut adapter files ...')
+    cmding(f'rm {ECLIP}/*.clean.fastq')
+    logger.info('Compressing sorted clean fastq files ...')
+    for fastq in glob.iglob(f'{ECLIP}/*.clean.sort.fastq'):
+        cmding(f'pigz -p 8 {fastq}')
+    logger.info('Compressing sorted mate files ...')
+    for mate in glob.iglob(f'{ECLIP}/repeat.elements.map/*/Unmapped.out.mate1'):
+        sample = os.path.basename(os.path.dirname(mate))
+        cmding(f'pigz -p 8 -c {mate} > {ECLIP}/{sample}.mate1.sort.fastq.gz')
+    for mate in glob.iglob(f'{ECLIP}/repeat.elements.map/*/Unmapped.out.mate2'):
+        sample = os.path.basename(os.path.dirname(mate))
+        cmding(f'pigz -p 8 -c {mate} > {ECLIP}/{sample}.mate2.sort.fastq.gz')
+    logger.info('Deleting map directories ...')
+    cmding(f'rm -rf {ECLIP}/repeat.elements.map {ECLIP}/reference.genome.map')
+    logger.info('Deleting BAM dedup temporary files ...')
+    cmding(f'rm {ECLIP}/*.dedup.*')
+    logger.info('Deleting temporary BAM files ...')
+    cmding(f'rm {ECLIP}/*.sort.bam')
+    if TYPE == 'paired':
+        cmding(f'rm {ECLIP}/*.merge.bam')
 #
 #
 # @ruffus.posttask(cleanup)
-# @ruffus.follows(ruffus.mkdir('qc'))
+# @ruffus.follows(ruffus.mkdir(QC))
 # @ruffus.merge([DESeq2, rMATS, sort_index_bam], 'qc/rnaseq.qc.html')
-# def qc(inputs, output):
-#     logger.info('Moving cutadapt metrics to qc ...')
-#     for metric in glob.iglob('fastq_to_bam/*.cutadapt.metrics'):
-#         cmding(f'mv {metric} qc/')
-#     logger.info('Moving STAR logs to qc ...')
-#     logs = glob.iglob('fastq_to_bam/*/*/Log.final.out')
-#     for log in logs:
-#         _, group, basename, _ = log.split('/')
-#         cmding(f'mv {log} qc/{basename}.{group}.log')
-#     logger.info('Moving feature count summary to qc ...')
-#     cmding(f'mv differential_expression/feature.count.summary qc/')
-#
-#     config = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'multiqc.config.yaml')
-#     cmd = ['multiqc', '--config', config, '--filename', output, '--force', 'qc']
-#     cmding(cmd, message='Running MultiQC to generating QC summary ...')
-#
-#
+def qc(inputs, output):
+    logger.info('Moving cutadapt metrics to qc ...')
+    cmding(f'mv {ECLIP}/*.clean.metrics {ECLIP}/*.trim.metrics {QC}/')
+    logger.info('Moving STAR logs to qc ...')
+    logs = glob.iglob(f'{ECLIP}/*/*/Log.final.out')
+    for log in logs:
+        _, group, basename, _ = log.split('/')
+        cmding(f'mv {log} {QC}/{basename}.{group}.log')
+
+    config = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'multiqc.config.yaml')
+    cmd = ['multiqc', '--config', config, '--filename', output, '--force', 'qc']
+    cmding(cmd, message='Running MultiQC to generating QC summary ...')
+
+
 def schedule():
     sbatch = """#!/usr/bin/env bash
 
@@ -959,6 +920,16 @@ export TMP={project}/tmp
                 'Job runtime:': f'{runtime} (D-HH:MM)'}
         for k, v in data.items():
             print(f'{k:>20} {v}')
+            
+            
+FOOTER = """
++======================================================================================================================+
+|                                                                                                                      |
+|                                                 MISSION ACCOMPLISHED                                                 |
+|{hh_mm_ss}|
+|                                                                                                                      |
++======================================================================================================================+
+"""
 
 
 @logger.catch()
@@ -968,19 +939,14 @@ def main():
     else:
         keys = ('MANIFEST', 'outdir', 'genome', 'repeat', 'processes')
         d = vars(options).copy()
-        d['processes'] = f'{PROCESS} / {options.cores}'
+        d['processes'] = f'{PROCESSES} / {options.cores}'
         setting = '\n'.join([f'{k.title():>22}: {v}' for k, v in d.items() if k in keys])
-        logger.debug(logo)
+        logger.debug(HEADER)
         logger.trace(f'Running eclip using the following settings:\n\n{setting}\n')
-        try:
-            ruffus.cmdline.run(options)
-        except OSError:
-            pass
-        finally:
-            logger.debug('')
-            run_time = int(time.perf_counter() - START_TIME)
-            logger.info(f'Mission Accomplished!')
-            logger.trace(f'Time consumed: {str(datetime.timedelta(seconds=run_time))}.')
+        ruffus.cmdline.run(options)
+        logger.debug('')
+        run_time = str(datetime.timedelta(seconds=int(time.perf_counter() - START_TIME)))
+        logger.trace(FOOTER.format(hh_mm_ss=f'time consumed: {run_time}'.upper().center(118)))
 
 
 if __name__ == '__main__':
