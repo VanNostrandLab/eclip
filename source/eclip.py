@@ -257,14 +257,17 @@ def cmding(cmd, **kwargs):
             command = ' '.join([f'\\\n  {c}' if c.startswith('-') or '<' in c or '>' in c else c for c in command])
             command = command.splitlines()
             commands = []
-            for c in command:
-                if len(c) <= 80:
+            for i, c in enumerate(command):
+                if i == 0:
                     commands.append(c)
                 else:
-                    items = c.strip().replace(' \\', '').split()
-                    commands.append(f'  {items[0]} {items[1]} \\')
-                    for item in items[2:]:
-                        commands.append(' ' * (len(items[0]) + 3) + item + ' \\')
+                    if len(c) <= 80:
+                        commands.append(c)
+                    else:
+                        items = c.strip().replace(' \\', '').split()
+                        commands.append(f'  {items[0]} {items[1]} \\')
+                        for item in items[2:]:
+                            commands.append(' ' * (len(items[0]) + 3) + item + ' \\')
             command = '\n'.join(commands)
             if command.endswith(' \\'):
                 command = command[:-2]
@@ -703,7 +706,7 @@ def make_bigwig_files(bam, bigwig):
         logger.info(message)
 
 
-@ruffus.merge(make_bigwig_files, HUB + 'hub.txt')
+@ruffus.merge(make_bigwig_files, HUB + '/hub.txt')
 def make_hub_files(inputs, output):
     message, start_time = 'Make hub track file ...', time.perf_counter()
     logger.info(message)
@@ -823,8 +826,8 @@ def cleanup():
     cmding(f'rm {ECLIP}/*.sort.bam')
     if TYPE == 'paired':
         cmding(f'rm {ECLIP}/*.merge.bam')
-#
-#
+
+
 # @ruffus.posttask(cleanup)
 # @ruffus.follows(ruffus.mkdir(QC))
 # @ruffus.merge([DESeq2, rMATS, sort_index_bam], 'qc/rnaseq.qc.html')
@@ -942,7 +945,7 @@ def main():
         d['processes'] = f'{PROCESSES} / {options.cores}'
         setting = '\n'.join([f'{k.title():>22}: {v}' for k, v in d.items() if k in keys])
         logger.debug(HEADER)
-        logger.trace(f'Running eclip using the following settings:\n\n{setting}\n')
+        logger.trace(f'\nRunning eclip using the following settings:\n\n{setting}\n')
         ruffus.cmdline.run(options)
         logger.debug('')
         run_time = str(datetime.timedelta(seconds=int(time.perf_counter() - START_TIME)))
