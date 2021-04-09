@@ -16,10 +16,14 @@ import datetime
 import sys
 import tempfile
 import shutil
+import math
+from collections import defaultdict
 
 import pysam as pysam
-import ruffus
+import scipy.stats as stats
 import pandas as pd
+import numpy as np
+import ruffus
 from loguru import logger
 
 ignored_args = ['target_tasks', 'jobs', 'use_threads', 'just_print', 'log_file', 'verbose', 'forced_tasks']
@@ -44,6 +48,12 @@ parser.add_argument('--track_label', type=str,
 parser.add_argument('--track_genome', type=str,
                     help="Genome name for the UCSC Genome Browser track, default: RNA-Seq",
                     default='hg19')
+parser.add_argument('--l2fc', type=int,
+                    help="Only consider peaks at or above this log2 fold change cutoff.",
+                    default=3)
+parser.add_argument('--l10p', type=int,
+                    help="Only consider peaks at or above this log10p value cutoff.",
+                    default=3)
 parser.add_argument('--job', type=str,
                     help="Name of your job, default: RNA-Seq",
                     default='RNA-Seq')
@@ -213,7 +223,7 @@ def parse_and_validate_samples():
             raise ValueError(f'Duplicated names found for ip_read\n{ip_read}.')
         if input_read.key in samples:
             raise ValueError(f'Duplicated names found for input_read\n{input_read}.')
-        samples.extend([ip_read, input_read])
+        samples.append([ip_read, input_read])
         reads[ip_read.key], reads[input_read.key] = ip_read, input_read
         sizes.extend([size(ip_read.fastq1, formatting=False), size(ip_read.fastq2, formatting=False),
                       size(input_read.fastq1, formatting=False), size(input_read.fastq2, formatting=False)])
@@ -224,6 +234,7 @@ def parse_and_validate_samples():
     return samples, reads, estimate_max_processes(), 'paired' if types[0] else 'single'
 
 
+HASH = 100000
 SAMPLES, READS, PROCESSES, TYPE = parse_and_validate_samples()
 VERSION = 1.0
 HEADER = fr"""
@@ -781,16 +792,139 @@ def clipper(bam, bed):
 @ruffus.jobs_limit(PROCESSES)
 @ruffus.transform(clipper, ruffus.suffix('.peak.clusters.bed'), '.peak.clusters.normalized.bed')
 def overlap_peaks(peak, norm_peak):
-    def mapped_read_number(bam):
-        cmd = f'samtools view -c -F 4 -o {bam}.mapped.read.number {bam}'
-        cmding(cmd, message=f'Counting mapped read number of {bam} {size(bam)} ...')
+    def parse_alignment(alignment):
+        chrom, start = alignment.reference_name, alignment.reference_start
+        cigar, mismatch, = alignment.cigartuples, alignment.get_tag('nM')
+        if alignment.flag in (0, 163):
+            strand = '+'
+        elif alignment.flag in (16, 147):
+            strand = '-'
+        else:
+            raise ValueError(f'Unknown flag {alignment.flag} for {alignment.query_name}')
         
-    ip_bam, input_bam = [(ip_read.bam, input_read.bam) for (ip_read, input_read) in SAMPLES
+        regions, position = [], start
+        for operation, length in cigar:
+            # pysam operations
+            # M	BAM_CMATCH	    0
+            # I	BAM_CINS	    1
+            # D	BAM_CDEL	    2
+            # N	BAM_CREF_SKIP	3
+            # S	BAM_CSOFT_CLIP	4
+            # H	BAM_CHARD_CLIP	5
+            # P	BAM_CPAD	    6
+            # =	BAM_CEQUAL	    7
+            # X	BAM_CDIFF	    8
+            # B	BAM_CBACK	    9
+            if operation == 3:
+                regions.append([chrom, strand, start - 1, position - 1])
+                position += length
+                start = position
+            elif operation == 0:
+                position += length
+            elif operation == 4:
+                pass
+            elif operation == 1:
+                pass
+            elif operation == 2:
+                position += length
+            else:
+                print(f'Unparsed operation {operation} and length {length}.')
+        regions.append([chrom, strand, start - 1, position - 1])
+        return regions
+
+    def parse_bam(bam, bins):
+        peaks = defaultdict(int)
+        with pysam.AlignmentFile(bam, 'rb') as sam:
+            mapped_read_count = sam.mapped
+            for i, alignment in enumerate(sam.fetch()):
+                regions = parse_alignment(alignment)
+                for chrom, strand, start, stop in regions:
+                    for n in range(int(start / HASH), int(stop / HASH) + 1, 1):
+                        peak = f'{chrom}{strand}{n}'
+                        if peak in bins:
+                            for row in bins[peak]:
+                                if not (row.start >= stop or row.stop <= start):
+                                    peaks[row] += 1
+        return peaks, mapped_read_count
+    
+    def parse_peaks(bed):
+        peaks, bins = [], defaultdict(list)
+        names = ['chrom', 'start', 'stop', 'gene', 'p', 'strand', 'start1', 'stop1']
+        df = pd.read_csv(bed, sep='\t', header=None, names=names)
+        for i, row in enumerate(df.itertuples()):
+            for n in range(int(row.start / HASH), int(row.stop / HASH) + 1, 1):
+                bins[f'{row.chrom}{row.strand}{n}'].append(row)
+        return df, bins
+    
+    def fisher_or_chi(ip_peak_count, ip_mapped_reads_count, input_peak_count, input_mapped_reads_count):
+        counts = locals()
+        total = sum(counts.values())
+        a = (ip_peak_count + input_peak_count) * (ip_peak_count + ip_mapped_reads_count) / total
+        b = (ip_mapped_reads_count + input_mapped_reads_count) * (ip_peak_count + ip_mapped_reads_count) / total
+        c = (ip_peak_count + input_peak_count) * (input_peak_count + input_mapped_reads_count) / total
+        d = (ip_mapped_reads_count + input_mapped_reads_count) * (input_peak_count + input_mapped_reads_count) / total
+        if ip_mapped_reads_count < a:
+            return 1, 'DEPL', 'N', 'depleted'
+        else:
+            direction = 'enriched'
+            if any([n < 5 for n in list(counts.values()) + [a, b, c, d]]):
+                v, p = stats.fisher_exact([(ip_peak_count, ip_mapped_reads_count),
+                                           (input_peak_count, input_mapped_reads_count)])
+                return p, 'F', 'F', direction
+            else:
+                v = math.pow(abs(ip_peak_count - a) - 0.5, 2) / a + \
+                    math.pow(abs(ip_mapped_reads_count - b) - 0.5, 2) / b + \
+                    math.pow(abs(input_peak_count - c) - 0.5, 2) / c + \
+                    math.pow(abs(input_mapped_reads_count - d) - 0.5, 2) / d
+                p = 1 - stats.chi2.cdf(v, 1)
+                if ip_peak_count < a:
+                    v = -1 * v
+                return p, v, 'C', direction
+    
+    def overlap_peak_with_bam(ip_bam, input_bam, bed):
+        df, peak_bins = parse_peaks(bed)
+        ip_peaks, ip_mapped_reads_count = parse_bam(ip_bam, peak_bins)
+        input_peaks, input_mapped_reads_count = parse_bam(input_bam, peak_bins)
+        normalized, full = [], []
+        for row in df.itertuples():
+            ip_peak_count, input_peak_count = ip_peaks.get(row, 1), input_peaks.get(row, 0) + 1
+            l2fc = math.log2((ip_peak_count / ip_mapped_reads_count) / (input_peak_count / input_mapped_reads_count))
+            p, v, stats_type, status = fisher_or_chi(ip_peak_count, ip_mapped_reads_count - ip_peak_count,
+                                                     input_peak_count, input_mapped_reads_count - input_peak_count)
+            l10p = -1 * math.log10(p) if p > 0 else 400
+            l10p = 0 if l10p == 0 else l10p
+            normalized.append([row.chrom, row.start, row.stop, l10p, l2fc, row.strand])
+            peak = f'{row.chrom}:{row.start}-{row.stop}:{row.strand}:{row.p}'
+            full.append([row.chrom, row.start, row.stop, peak, ip_peak_count, input_peak_count,
+                         p, v, stats_type, status, l10p, l2fc])
+        
+        normalized = pd.DataFrame(normalized)
+        normalized.to_csv(bed.replace('.bed', '.normalized.bed'), sep='\t', index=False, header=False)
+        columns = ['chrom', 'start', 'end', 'peak', 'ip_count', 'input_count',
+                   'p', 'v', 'stats_type', 'status', 'l10p', 'l2fc']
+        full = pd.DataFrame(full, columns=columns)
+        full.to_csv(bed.replace('.bed', '.normalized.full.bed'), sep='\t', index=False, header=False)
+        full = full[(full['l10p'] >= options.l10p) & (full['l2fc'] >= options.l2fc)]
+        entropy = bed.replace('.bed', '.entropy.txt')
+        if full.empty:
+            logger.warning(f'No peaks above l2fc and l10p thresholds in {bed},\n{" " * 11}'
+                           f'calculating entropy skipped only an empty file {entropy} was touched.')
+            s = ''
+        else:
+            x = full['ip_count'] / ip_mapped_reads_count
+            y = full['input_count'] / input_mapped_reads_count
+            s = str(np.sum(x * np.log2(x / y)))
+        with open(entropy, 'w') as o:
+            o.write(s)
+
+    message, start_time = f'Normalizing peaks in {peak} ...', time.perf_counter()
+    logger.info(message)
+    ip_bam, input_bam = [[ip_read.bam, input_read.bam] for (ip_read, input_read) in SAMPLES
                          if ip_read.bed == peak][0]
-    ip_count, input_count = mapped_read_number(ip_bam), mapped_read_number(input_bam)
-    cmd = ['overlap_peak.pl', ip_bam, input_bam, peak, ip_count, input_count, norm_peak]
-    cmding(cmd, message=f'Normalizing peaks in {peak} {size(peak)} ...')
-    cmding(f'rm {ip_count} {input_count}')
+    overlap_peak_with_bam(ip_bam, input_bam, peak)
+    run_time = int(time.perf_counter() - start_time)
+    message = message.replace(' ...', f' completed in [{str(datetime.timedelta(seconds=run_time))}].')
+    logger.info(message)
     
 
 def calculate_entropy():
