@@ -38,7 +38,7 @@ conda_install "bioconda" "${venv}" perl-app-cpanminus
 "${venv}/bin/cpanm" Statistics::R --quiet >/dev/null;
 echo "    Successful installed 3 Perl packages."
 
-for package in bedtools cutadapt umi_tools fastq-tools samtools=1.9 star=2.4.0j pysam ruffus pandas loguru
+for package in bedtools cutadapt umi_tools fastq-tools samtools=1.9 star=2.4.0j pysam ruffus pandas loguru pureclip
 do
   conda_install "bioconda" "${venv}" "${package}"
 done

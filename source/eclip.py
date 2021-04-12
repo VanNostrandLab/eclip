@@ -660,7 +660,7 @@ def sort_bam(bam, out):
 @ruffus.transform(sort_bam, ruffus.regex(r"^(.+)\.(.+)\.sort.dedup.sort.bam$"), r'\1.merge.bam')
 def merge_bam(bam, out):
     if TYPE == 'single':
-        cmding(f'mv {bam} {out}')
+        cmding(f'cp {bam} {out}')
     else:
         merge_paired_bam(bam, out)
 
@@ -672,7 +672,7 @@ def index_bam(bam, out):
         cmding(f'samtools view -f 128 -@ {options.cores} -b -o {out} {bam}',
                message=f'Extracting r2 reads from {bam} {size(bam)} ...')
     else:
-        cmding(f'mv {bam} {out}')
+        cmding(f'cp {bam} {out}')
     if not os.path.exists(f'{bam}.bai'):
         index_sorted_bam(out)
         
@@ -780,16 +780,31 @@ container multiWig
     logger.info(message)
 
 
-@ruffus.jobs_limit(PROCESSES)
+@ruffus.jobs_limit(1)
 @ruffus.follows(make_hub_files)
 @ruffus.transform([read.bam for read in READS.values() if read.type == 'IP'],
                   ruffus.suffix('.bam'), '.peak.clusters.bed')
 def clipper(bam, bed):
-    cmd = f'clipper --species {options.species} --bam {bam} --outfile {bed}'
-    cmding(cmd, message=f'Calling peaks from {bam} {size(bam)} ...')
+    cmd = f'clipper --species {options.species} --processors {options.cores} --bam {bam} --outfile {bed}'
+    cmding(cmd, message=f'Calling peaks from {bam} {size(bam)} using clipper ...')
+
+
+@ruffus.jobs_limit(1)
+@ruffus.follows(clipper)
+@ruffus.transform([read.bam for read in READS.values() if read.type == 'IP'],
+                  ruffus.suffix('.bam'), '.crosslink.sites.bed')
+def pureclip(bam, bed):
+    ip_bam, input_bam = [[ip_read.bam, input_read.bam] for (ip_read, input_read) in SAMPLES
+                         if ip_read.bam == bam][0]
+    cmd = ['pureclip', '-i', ip_bam, '-bai', f'{ip_bam}.bai', '-g', f'{options.genome}/genome.fa',
+           '-iv', "'chr1;chr2;chr3'", '-nt', options.cores, '-ibam', input_bam, '-ibai', f'{input_bam}.bai',
+           '-o', bed, '-or', bed.replace('.crosslink.sites.bed', '.binding.regions.bed'),
+           '>', bed.replace('.crosslink.sites.bed', '.pureclip.log')]
+    cmding(cmd, message=f'Calling peaks from {bam} {size(bam)} using pureCLIP ...')
 
 
 @ruffus.jobs_limit(PROCESSES)
+@ruffus.follows(pureclip)
 @ruffus.transform(clipper, ruffus.suffix('.peak.clusters.bed'), '.peak.clusters.normalized.bed')
 def overlap_peaks(peak, norm_peak):
     def parse_alignment(alignment):
@@ -894,9 +909,8 @@ def overlap_peaks(peak, norm_peak):
             l10p = -1 * math.log10(p) if p > 0 else 400
             l10p = 0 if l10p == 0 else l10p
             normalized.append([row.chrom, row.start, row.stop, l10p, l2fc, row.strand])
-            peak = f'{row.chrom}:{row.start}-{row.stop}:{row.strand}:{row.p}'
-            full.append([row.chrom, row.start, row.stop, peak, ip_peak_count, input_peak_count,
-                         p, v, stats_type, status, l10p, l2fc])
+            full.append([row.chrom, row.start, row.stop, f'{row.chrom}:{row.start}-{row.stop}:{row.strand}:{row.p}',
+                         ip_peak_count, input_peak_count, p, v, stats_type, status, l10p, l2fc])
         
         normalized = pd.DataFrame(normalized)
         normalized.to_csv(bed.replace('.bed', '.normalized.bed'), sep='\t', index=False, header=False)
@@ -932,6 +946,22 @@ def calculate_entropy():
 
 
 def compress_peaks():
+    pass
+
+
+def sort_compressed_peaks():
+    pass
+
+
+def remove_peaks_on_blacklist():
+    pass
+
+
+def narrow_peaks():
+    pass
+
+
+def make_big_bed():
     pass
 
 
