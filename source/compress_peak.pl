@@ -3,15 +3,16 @@
 use warnings;
 use strict;
 
-unless ($ARGV[0] && $ARGV[1] && $ARGV[2]) {
-	print STDERR "Usage: perl compress_peak.pl normalized_full_bed compressed_bed compressed_full_bed\n\n";
+unless ($ARGV[0] && $ARGV[1]) {
+	print STDERR "Usage: perl compress_peak.pl normalized_full_bed compressed_bed\n\n";
 	exit;
 }
 
 my $hashing_value = 100000;
 my $bed = $ARGV[0];
 my $compressed_bed = $ARGV[1];
-my $compressed_full_bed = $ARGV[2];
+my $compressed_full_bed = $compressed_bed;
+$compressed_full_bed =~ s/\.bed/.full.bed/;
 open(O, ">$compressed_bed") || die "Cannot open $compressed_bed for writing!";
 open(FULL, ">$compressed_full_bed") || die "Cannot open $compressed_full_bed for writing!";
 
