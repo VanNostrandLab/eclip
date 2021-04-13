@@ -3,15 +3,17 @@
 use warnings;
 use strict;
 
-unless ($ARGV[0] && $ARGV[1]) {
-	print STDERR "Usage: perl compress_peak.pl normalized_full_bed output_file\n\n";
+unless ($ARGV[0] && $ARGV[1] && $ARGV[2]) {
+	print STDERR "Usage: perl compress_peak.pl normalized_full_bed compressed_bed compressed_full_bed\n\n";
 	exit;
 }
 
 my $hashing_value = 100000;
 my $bed = $ARGV[0];
-my $output = $ARGV[1];
-open(O, ">$output");
+my $compressed_bed = $ARGV[1];
+my $compressed_full_bed = $ARGV[2];
+open(O, ">$compressed_bed") || die "Cannot open $compressed_bed for writing!";
+open(FULL, ">$compressed_full_bed") || die "Cannot open $compressed_full_bed for writing!";
 
 my %peaks2size;
 my %peaks2l2fc;
@@ -19,6 +21,7 @@ my %peaks2l10p;
 my %peaks2start;
 my %read_hash;
 my %peak_hash;
+my %long_lines;
 &read($bed);
 
 for my $chrom (keys %read_hash) {
@@ -62,6 +65,7 @@ for my $chrom (keys %read_hash) {
 			my ($p1chrom,$p1position,$p1strand,$p1l10p,$p1l2fc) = split(/\:/, $peak);
 				my ($p1start, $p1stop) = split(/\-/, $p1position);
 			print O "$p1chrom\t$p1start\t$p1stop\t$p1l10p\t$p1l2fc\t$p1strand\n";
+			print FULL "".$long_lines{$p1chrom.":".$p1position.":".$p1strand}."\n";
 		}
     }
 }
@@ -69,23 +73,25 @@ close(O);
 
 sub read {
     my $file = shift;
-    open(F, $file);
+    open(F, $file) || die "Cannot open $file\n";
     for my $line (<F>) {
 		chomp($line);
 		my @fields = split(/\t/, $line);
-		my $chrom = $fields[0];
+		my ($chrom, $position, $strand, $p) = split(/\:/, $fields[3]);
 		my $start = $fields[1];
 		my $stop = $fields[2];
-		my $l10p = $fields[3];
-		my $l2fc = $fields[4];
-		my $strand = $fields[5];
+		my $l10p = $fields[10];
+		my $l2fc = $fields[11];
 
 		my $peak_id = $chrom.":".$start."-".$stop.":".$strand.":".$l10p.":".$l2fc;
 		push @{$peak_hash{$chrom}{$strand}},$peak_id;
 		$peaks2start{$chrom}{$strand}{$peak_id} = $start;
 		$peaks2l10p{$chrom}{$strand}{$peak_id} = $l10p;
 		$peaks2l2fc{$chrom}{$strand}{$peak_id} = $l2fc;
-		$peaks2size{$chrom}{$strand}{$peak_id} = $stop-$start;
+		$peaks2size{$chrom}{$strand}{$peak_id} = $stop - $start;
+
+		my $long_line = join("\t", @fields);
+		$long_lines{$chrom.":".$start."-".($stop).":".$strand} = $long_line;
 
 		my $x = int($start / $hashing_value);
 		my $y = int( $stop / $hashing_value);
