@@ -3,126 +3,95 @@
 use warnings;
 use strict;
 
+unless ($ARGV[0] && $ARGV[1]) {
+	print STDERR "Usage: perl compress_peak.pl normalized_full_bed output_file\n\n";
+	exit;
+}
+
 my $hashing_value = 100000;
-my $fi = $ARGV[0];
-my $output_fi = $ARGV[1];
-open(O,">$output_fi");
+my $bed = $ARGV[0];
+my $output = $ARGV[1];
+open(O, ">$output");
 
 my %peaks2size;
-my %peaks2l2fenr;
+my %peaks2l2fc;
 my %peaks2l10p;
 my %peaks2start;
 my %read_hash;
 my %peak_hash;
-&readfi($fi);
+&read($bed);
 
-my %overlap_hash;
-for my $chr (keys %read_hash) {
-    for my $str ("+","-") {
-	my %deleted_peaks;
-	my %kept_peaks;
+for my $chrom (keys %read_hash) {
+    for my $strand ("+", "-") {
+		my %discard_peaks;
+		my @sorted_peaks = sort {$peaks2l10p{$chrom}{$strand}{$b} <=> $peaks2l10p{$chrom}{$strand}{$a} or
+								$peaks2l2fc{$chrom}{$strand}{$b} <=> $peaks2l2fc{$chrom}{$strand}{$a} or
+								$peaks2size{$chrom}{$strand}{$b} <=> $peaks2size{$chrom}{$strand}{$a} or
+								$peaks2start{$chrom}{$strand}{$b} <=> $peaks2start{$chrom}{$strand}{$a}}
+								keys %{$peaks2l10p{$chrom}{$strand}};
 
-	my @sorted_peaks = sort {$peaks2l10p{$chr}{$str}{$fi}{$b} <=> $peaks2l10p{$chr}{$str}{$fi}{$a} or $peaks2l2fenr{$chr}{$str}{$fi}{$b} <=> $peaks2l2fenr{$chr}{$str}{$fi}{$a} or $peaks2size{$chr}{$str}{$fi}{$b} <=> $peaks2size{$chr}{$str}{$fi}{$a} or $peaks2start{$chr}{$str}{$fi}{$b} <=> $peaks2start{$chr}{$str}{$fi}{$a}} keys %{$peaks2l10p{$chr}{$str}{$fi}};
-	my $i=0;
+		for my $peak1 (@sorted_peaks) {
+			my $verbose_flag = 1;
+			next if (exists $discard_peaks{$peak1});
+			my ($p1chrom, $p1position, $p1strand, $p1l10p, $p1l2fc) = split(/\:/, $peak1);
+			my ($p1start, $p1stop) = split(/\-/, $p1position);
+			my $p1x = int($p1start / $hashing_value);
+			my $p1y = int( $p1stop / $hashing_value);
+			for my $p1i ($p1x..$p1y) {
+				for my $peak (@{$read_hash{$chrom}{$strand}{$p1i}}) {
+					next if (exists $discard_peaks{$peak});
+					next if ($peak eq $peak1);
+					my ($p2chrom, $p2position, $p2strand, $p2l10p, $p2l2fc) = split(/\:/, $peak);
+					my ($p2start, $p2stop) = split(/\-/, $p2position);
+					next if ($p2stop <= $p1start);
+					next if ($p1stop <= $p2start);
 
-	for my $peak1 (@sorted_peaks) {
-	    my $verbose_flag = 0;
-	    next if (exists $deleted_peaks{$peak1});
-	    my ($p1chr,$p1pos,$p1str,$p1vsinput_l10p,$p1vsinput_l2fenr) = split(/\:/,$peak1);
-	    my ($p1start,$p1stop) = split(/\-/,$p1pos);
-	    my $p1x = int($p1start / $hashing_value);
-	    my $p1y = int( $p1stop / $hashing_value);
-	    for my $p1i ($p1x..$p1y) {
-		for my $tocomp_peak (@{$read_hash{$chr}{$str}{$fi}{$p1i}}) {
-		    print STDERR "comparing $peak1 $tocomp_peak\n" if ($verbose_flag == 1);
-		    next if (exists $deleted_peaks{$tocomp_peak});
-		    next if ($tocomp_peak eq $peak1);
-
-		    my ($p2compchr,$p2comppos,$p2compstr,$p2compvsinput_l10p,$p2compvsinput_l2fenr) = split(/\:/,$tocomp_peak);
-		    my ($p2compstart,$p2compstop) = split(/\-/,$p2comppos);
-
-		    next if ($p2compstop <= $p1start);
-		    next if ($p1stop <= $p2compstart);
-
-		    if ($p1vsinput_l10p >= $p2compvsinput_l10p) {
-			print STDERR "discarding $tocomp_peak vs $peak1\n" if ($verbose_flag == 1);
-			$deleted_peaks{$tocomp_peak} = 1;
-		    } elsif ($p1vsinput_l10p < $p2compvsinput_l10p) {
-			$deleted_peaks{$peak1} = 1;
-			print STDERR "discarding $peak1 vs $tocomp_peak\n" if ($verbose_flag == 1);
-		    } else {
-			print STDERR "weird error shouldn't happen $peak1\n";
-		    }
+					if ($p1l10p >= $p2l10p) {
+						print STDERR "Comparing $peak1 and $peak, $peak was discarded\n" if ($verbose_flag == 1);
+						$discard_peaks{$peak} = 1;
+					} else {
+						$discard_peaks{$peak1} = 1;
+						print STDERR "Comparing $peak1 and $peak, $peak1 was discarded\n" if ($verbose_flag == 1);
+					}
+				}
+			}
 		}
-	    }
-	}
-	
-	for my $peak (@sorted_peaks) {
-	    next if (exists $deleted_peaks{$peak});
-	    my ($p1chr,$p1pos,$p1str,$p1vsinput_l10p,$p1vsinput_l2fenr) = split(/\:/,$peak);
-            my ($p1start,$p1stop) = split(/\-/,$p1pos);
-	    print O "$p1chr\t$p1start\t$p1stop\t$p1vsinput_l10p\t$p1vsinput_l2fenr\t$p1str\n";
-	}
+
+		for my $peak (@sorted_peaks) {
+			next if (exists $discard_peaks{$peak});
+			my ($p1chrom,$p1position,$p1strand,$p1l10p,$p1l2fc) = split(/\:/, $peak);
+				my ($p1start, $p1stop) = split(/\-/, $p1position);
+			print O "$p1chrom\t$p1start\t$p1stop\t$p1l10p\t$p1l2fc\t$p1strand\n";
+		}
     }
 }
 close(O);
 
-
-sub min {
-    my $x = shift;
-    my $y = shift;
-    
-    if ($x < $y) {
-	return($x);
-    } else {
-	return($y);
-    }
-}
-
-sub max {
-    my $x = shift;
-    my $y = shift;
-
-    if ($x > $y) {
-	return($x);
-    } else {
-	return($y);
-    }
-}
-
-sub readfi {
-    my $fi = shift;
-    open(F,$fi);
+sub read {
+    my $file = shift;
+    open(F, $file);
     for my $line (<F>) {
-	chomp($line);
+		chomp($line);
+		my @fields = split(/\t/, $line);
+		my $chrom = $fields[0];
+		my $start = $fields[1];
+		my $stop = $fields[2];
+		my $l10p = $fields[3];
+		my $l2fc = $fields[4];
+		my $strand = $fields[5];
 
-	my @tmp = split(/\t/,$line);
+		my $peak_id = $chrom.":".$start."-".$stop.":".$strand.":".$l10p.":".$l2fc;
+		push @{$peak_hash{$chrom}{$strand}},$peak_id;
+		$peaks2start{$chrom}{$strand}{$peak_id} = $start;
+		$peaks2l10p{$chrom}{$strand}{$peak_id} = $l10p;
+		$peaks2l2fc{$chrom}{$strand}{$peak_id} = $l2fc;
+		$peaks2size{$chrom}{$strand}{$peak_id} = $stop-$start;
 
-	my $chr = $tmp[0];
-	my $str = $tmp[5];
-	my $start = $tmp[1];
-	my $stop = $tmp[2];
-        my $vsinput_l10p = $tmp[3];
-        my $vsinput_l2fenr = $tmp[4];
-
-	my $peak_id = $chr.":".$start."-".$stop.":".$str.":".$vsinput_l10p.":".$vsinput_l2fenr;
-
-
-	push @{$peak_hash{$chr}{$str}{$fi}},$peak_id;
-	$peaks2start{$chr}{$str}{$fi}{$peak_id} = $start;
-	$peaks2l10p{$chr}{$str}{$fi}{$peak_id} = $vsinput_l10p;
-        $peaks2l2fenr{$chr}{$str}{$fi}{$peak_id} = $vsinput_l2fenr;
-	$peaks2size{$chr}{$str}{$fi}{$peak_id} = $stop-$start;
-
-	my $x = int($start / $hashing_value);
-	my $y = int( $stop / $hashing_value);
-
-	for my $i ($x..$y) {
-	    push @{$read_hash{$chr}{$str}{$fi}{$i}},$peak_id
-
-
-	}
-
+		my $x = int($start / $hashing_value);
+		my $y = int( $stop / $hashing_value);
+		for my $i ($x..$y) {
+			push @{$read_hash{$chrom}{$strand}{$i}}, $peak_id
+		}
     }
     close(F);
 }
