@@ -54,6 +54,9 @@ parser.add_argument('--l2fc', type=int,
 parser.add_argument('--l10p', type=int,
                     help="Only consider peaks at or above this log10p value cutoff.",
                     default=3)
+parser.add_argument('--enrichment_filter', type=int,
+                    help="Pre-filter peaks that are enriched over input (default: 0).",
+                    default=3)
 parser.add_argument('--job', type=str,
                     help="Name of your job, default: RNA-Seq",
                     default='RNA-Seq')
@@ -803,14 +806,15 @@ def pureclip(bam, bed):
     cmding(cmd, message=f'Calling peaks from {bam} {size(bam)} using pureCLIP ...')
 
 
+def mapped_read_count(bam):
+    with pysam.AlignmentFile(bam, 'rb') as sam:
+        return sam.mapped
+    
+    
 @ruffus.jobs_limit(PROCESSES)
 @ruffus.follows(pureclip)
 @ruffus.transform(clipper, ruffus.suffix('.peak.clusters.bed'), '.peak.clusters.normalized.bed')
 def overlap_peaks(peak, norm_peak):
-    def mapped_read_count(bam):
-        with pysam.AlignmentFile(bam, 'rb') as sam:
-            return sam.mapped
-
     ip_bam, input_bam = [[ip_read.bam, input_read.bam] for (ip_read, input_read) in SAMPLES
                          if ip_read.bed == peak][0]
     cmd = ['overlap_peak.pl', ip_bam, input_bam, peak,
@@ -823,7 +827,37 @@ def compress_peaks(bed, output):
     bed = bed.replace('.bed', '.full.bed')
     cmd = ['compress_peak.pl', bed, output]
     cmding(cmd, message=f'Compressing peaks in {bed} {size(bed)} ...')
-    
+
+
+@ruffus.transform(compress_peaks, ruffus.suffix('.normalized.compressed.bed'), '.entropy.bed')
+def compute_entropy(bed, output):
+    message, start_time = f'Calculating entropy for {bed} ...', time.perf_counter()
+    logger.info(message)
+    peak_bed = bed.replace('.normalized.compressed.bed', '.bed')
+    ip_bam, input_bam = [[ip_read.bam, input_read.bam] for (ip_read, input_read) in SAMPLES
+                         if ip_read.bed == peak_bed][0]
+    ip_mapped_read_count, input_mapped_read_count = mapped_read_count(ip_bam), mapped_read_count(input_bam)
+    bed = bed.replace('.bed', '.full.bed')
+    columns = ['chrom', 'start', 'end', 'peak', 'ip_read_number', 'input_read_number',
+               'p', 'v', 'method', 'status', 'l10p', 'l2fc']
+    df = pd.read_csv(bed, sep='\t', header=None, names=columns)
+    df['pi'] = df['ip_read_number'] / ip_mapped_read_count
+    df['qi'] = df['input_read_number'] / input_mapped_read_count
+    df['entropy'] = df.apply(lambda row: 0 if row.pi <= row.qi else row.pi * math.log2(row.pi / row.qi), axis=1)
+    df['excess_reads'] = df['pi'] - df['qi']
+    entropy = output.replace('.entropy.bed', '.entropy.tsv')
+    df.to_csv(entropy, index=False, columns=columns + ['entropy'], sep='\t', header=False)
+    excess_read = output.replace('.entropy.tsv', 'excess.reads.entropy.tsv')
+    df.to_csv(excess_read, index=False, columns=columns + ['excess_reads'], sep='\t', header=False)
+    df['strand'] = df.peak.str.split(':', expand=True)[2]
+    df['l2fc'] = df['l2fc'].map('{:.15f}'.format)
+    df['entropy'] = df['entropy'].map('{:.10f}'.format)
+    columns = ['chrom', 'start', 'end', 'l2fc', 'entropy', 'strand']
+    df.to_csv(output, index=False, columns=columns, sep='\t', header=False)
+    run_time = int(time.perf_counter() - start_time)
+    message = message.replace(' ...', f' completed in [{str(datetime.timedelta(seconds=run_time))}].')
+    logger.info(message)
+
     
 def sort_compressed_peaks():
     pass
