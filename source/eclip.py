@@ -830,7 +830,7 @@ def compress_peaks(bed, output):
 
 
 @ruffus.transform(compress_peaks, ruffus.suffix('.normalized.compressed.bed'), '.entropy.bed')
-def compute_entropy(bed, output):
+def calculate_entropy(bed, output):
     message, start_time = f'Calculating entropy for {bed} ...', time.perf_counter()
     logger.info(message)
     peak_bed = bed.replace('.normalized.compressed.bed', '.bed')
@@ -852,11 +852,34 @@ def compute_entropy(bed, output):
     df['strand'] = df.peak.str.split(':', expand=True)[2]
     df['l2fc'] = df['l2fc'].map('{:.15f}'.format)
     df['entropy'] = df['entropy'].map('{:.10f}'.format)
-    columns = ['chrom', 'start', 'end', 'l2fc', 'entropy', 'strand']
+    # For IDR 2.0.2, columns 'excess_reads', 'pi', and 'qi' need to be excluded for .entropy.bed
+    # For IDR 2.0.3, columns 'excess_reads', 'pi', and 'qi' need to be retained for .entropy.bed
+    columns = ['chrom', 'start', 'end', 'l2fc', 'entropy', 'strand', 'excess_reads', 'pi', 'qi']
     df.to_csv(output, index=False, columns=columns, sep='\t', header=False)
     run_time = int(time.perf_counter() - start_time)
     message = message.replace(' ...', f' completed in [{str(datetime.timedelta(seconds=run_time))}].')
     logger.info(message)
+    
+    
+@ruffus.merge(calculate_entropy, ECLIP + '/01v02.idr.out.bed')
+def idr_peaks(inputs, output):
+    (peak1, peak2), idr_out = inputs, output.replace('.bed', '')
+    cmd = ['idr', '--sample', peak1, peak2, '--input-file-type', 'bed', '--rank', 5,
+           '--peak-merge-method', 'max', '--plot', '-o', idr_out]
+    cmding(cmd, message=f'Running IDR to rank peaks in {peak1} and\n{" " * 40}{peak2} ...')
+    cmd = ['parse_idr_peaks.pl', idr_out, peak1, peak2, output]
+    cmding(cmd, message=f'Parsing IDR peaks in {idr_out} ...')
+
+
+def overlap_idr_peaks(idr_peak_bed, bed):
+    for ip_read, input_read in SAMPLES:
+        cmd = ['overlap_peak.pl', ip_read.bam, input_read.bam, idr_peak_bed,
+               mapped_read_count(ip_read.bam), mapped_read_count(input_read.bam), bed]
+        cmding(cmd, message=f'Normalizing IDR peaks in {idr_peak_bed} {size(idr_peak_bed)} ...')
+
+
+def reproducible_peaks():
+    pass
 
     
 def sort_compressed_peaks():
