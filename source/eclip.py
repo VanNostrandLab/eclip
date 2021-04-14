@@ -179,12 +179,20 @@ class Read:
         self.full_bed = f'{ECLIP}/{self.key}.peak.clusters.full.bed' if read_type == 'ip' else ''
         self.normalized_bed = f'{ECLIP}/{self.key}.peak.clusters.normalized.bed' if read_type == 'ip' else ''
         self.compressed_bed = f'{ECLIP}/{self.key}.peak.clusters.compressed.bed' if read_type == 'ip' else ''
+        self.entropy_bed = f'{ECLIP}/{self.key}.peak.clusters.entropy.bed' if read_type == 'ip' else ''
 
 
 class Sample:
-    def __init__(self, ip_read, input_read):
+    def __init__(self, ip_read, input_read, index_number):
         self.ip_read = Read(ip_read, 'ip')
         self.input_read = Read(input_read, 'input')
+        self.peak_bed = self.ip_read.bed
+        self.peak_full_bed = self.ip_read.full_bed
+        self.peak_normalized_bed = self.ip_read.normalized_bed
+        self.peak_compressed_bed = self.ip_read.compressed_bed
+        self.peak_entropy_bed = self.ip_read.entropy_bed
+        self.idr_bed = f'{ECLIP}/01v02.idr.out.bed'
+        self.idr_merged_bed = f'{ECLIP}/01v02.idr.out.0102.merged.{index_number}.bed'
 
 
 def size(file, formatting=True):
@@ -214,19 +222,23 @@ def parse_and_validate_samples():
             n = options.cores
         return n
     
-    samples, reads, sizes, types = [], {}, [], []
-    for sample in options.manifest.get('samples', []):
+    samples, reads, sizes, types, names = [], {}, [], [], set()
+    for i, sample in enumerate(options.manifest.get('samples', []), 1):
         ip_read, input_read = sample.get('ip_read', {}), sample.get('input_read', {})
         if not ip_read:
             raise KeyError(f'No key ip_read was found in sample\n{sample}.')
         if not input_read:
             raise KeyError('No key input_read was found in sample\n{sample}.')
         ip_read, input_read = Read(ip_read, 'ip'), Read(input_read, 'input')
-        if ip_read.key in samples:
+        if ip_read.key in names:
             raise ValueError(f'Duplicated names found for ip_read\n{ip_read}.')
-        if input_read.key in samples:
+        else:
+            names.add(ip_read.key)
+        if input_read.key in names:
             raise ValueError(f'Duplicated names found for input_read\n{input_read}.')
-        samples.append([ip_read, input_read])
+        else:
+            names.add(input_read.key)
+        samples.append(Sample(ip_read, input_read, i))
         reads[ip_read.key], reads[input_read.key] = ip_read, input_read
         sizes.extend([size(ip_read.fastq1, formatting=False), size(ip_read.fastq2, formatting=False),
                       size(input_read.fastq1, formatting=False), size(input_read.fastq2, formatting=False)])
@@ -797,8 +809,8 @@ def clipper(bam, bed):
 @ruffus.transform([read.bam for read in READS.values() if read.type == 'IP'],
                   ruffus.suffix('.bam'), '.crosslink.sites.bed')
 def pureclip(bam, bed):
-    ip_bam, input_bam = [[ip_read.bam, input_read.bam] for (ip_read, input_read) in SAMPLES
-                         if ip_read.bam == bam][0]
+    ip_bam, input_bam = [[sample.ip_read.bam, sample.input_read.bam] for sample in SAMPLES
+                         if sample.ip_read.bam == bam][0]
     cmd = ['pureclip', '-i', ip_bam, '-bai', f'{ip_bam}.bai', '-g', f'{options.genome}/genome.fa',
            '-iv', "'chr1;chr2;chr3'", '-nt', options.cores, '-ibam', input_bam, '-ibai', f'{input_bam}.bai',
            '-o', bed, '-or', bed.replace('.crosslink.sites.bed', '.binding.regions.bed'),
@@ -815,8 +827,8 @@ def mapped_read_count(bam):
 @ruffus.follows(pureclip)
 @ruffus.transform(clipper, ruffus.suffix('.peak.clusters.bed'), '.peak.clusters.normalized.bed')
 def overlap_peaks(peak, norm_peak):
-    ip_bam, input_bam = [[ip_read.bam, input_read.bam] for (ip_read, input_read) in SAMPLES
-                         if ip_read.bed == peak][0]
+    ip_bam, input_bam = [[sample.ip_read.bam, sample.input_read.bam] for sample in SAMPLES
+                         if sample.ip_read.bed == peak][0]
     cmd = ['overlap_peak.pl', ip_bam, input_bam, peak,
            mapped_read_count(ip_bam), mapped_read_count(input_bam), norm_peak]
     cmding(cmd, message=f'Normalizing peaks in {peak} {size(peak)} ...')
@@ -834,8 +846,8 @@ def calculate_entropy(bed, output):
     message, start_time = f'Calculating entropy for {bed} ...', time.perf_counter()
     logger.info(message)
     peak_bed = bed.replace('.normalized.compressed.bed', '.bed')
-    ip_bam, input_bam = [[ip_read.bam, input_read.bam] for (ip_read, input_read) in SAMPLES
-                         if ip_read.bed == peak_bed][0]
+    ip_bam, input_bam = [[sample.ip_read.bam, sample.input_read.bam] for sample in SAMPLES
+                         if sample.ip_read.bed == peak_bed][0]
     ip_mapped_read_count, input_mapped_read_count = mapped_read_count(ip_bam), mapped_read_count(input_bam)
     bed = bed.replace('.bed', '.full.bed')
     columns = ['chrom', 'start', 'end', 'peak', 'ip_read_number', 'input_read_number',
@@ -867,19 +879,44 @@ def idr_peaks(inputs, output):
     cmd = ['idr', '--sample', peak1, peak2, '--input-file-type', 'bed', '--rank', 5,
            '--peak-merge-method', 'max', '--plot', '-o', idr_out]
     cmding(cmd, message=f'Running IDR to rank peaks in {peak1} and\n{" " * 40}{peak2} ...')
-    cmd = ['parse_idr_peaks.pl', idr_out, peak1, peak2, output]
+    cmd = ['parse_idr_peaks.pl', idr_out, peak1.replace('.bed', '.tsv'), peak2.replace('.bed', '.tsv'), output]
     cmding(cmd, message=f'Parsing IDR peaks in {idr_out} ...')
 
 
-def overlap_idr_peaks(idr_peak_bed, bed):
-    for ip_read, input_read in SAMPLES:
-        cmd = ['overlap_peak.pl', ip_read.bam, input_read.bam, idr_peak_bed,
-               mapped_read_count(ip_read.bam), mapped_read_count(input_read.bam), bed]
+@ruffus.transform(idr_peaks, ruffus.suffix('.idr.out.bed'), '.idr.out.bed.overlapped')
+def overlap_idr_peaks(idr_peak_bed, output):
+    for i, sample in SAMPLES:
+        bed = idr_peak_bed.replace('.bed', f'.01020.merged.0{i}.bed')
+        cmd = ['overlap_peak.pl', sample.ip_read.bam, sample.input_read.bam, idr_peak_bed,
+               mapped_read_count(sample.ip_read.bam), mapped_read_count(sample.input_read.bam), 
+               sample.idr_merged_bed]
         cmding(cmd, message=f'Normalizing IDR peaks in {idr_peak_bed} {size(idr_peak_bed)} ...')
+    with open(output, 'w') as o:
+        o.write('')
 
 
-def reproducible_peaks():
+def reproducible_peaks(file, output):
     pass
+    cmd = ['reproducible_peaks.pl',
+           file.replace('.bed.overlapped', '0102.merged.01.full.bed'),
+           file.replace('.bed.overlapped', '0102.merged.02.full.bed'),
+           f'{ECLIP}/reproducible.peaks.01.full.bed',
+           f'{ECLIP}/reproducible.peaks.02.full.bed',
+           f'{ECLIP}/reproducible.peaks.bed',
+           f'{ECLIP}/reproducible.peaks.custom.bed',
+           ]
+    """
+    get_reproducing_peaks.pl \
+    01v02.IDR.out.0102merged.01.bed.full \
+    01v02.IDR.out.0102merged.02.bed.full \
+    reproducible_peaks.01.bed.full \
+    reproducible_peaks.02.bed.full \
+    reproducible_peaks.bed \
+    reproducible_peaks.custombed \
+    rep1_normed_peaks.compressed.bed.entropy.full \
+    rep2_normed_peaks.compressed.bed.entropy.full \
+    01v02.idr.out
+    """
 
     
 def sort_compressed_peaks():
