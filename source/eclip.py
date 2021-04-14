@@ -37,6 +37,8 @@ parser.add_argument('--outdir', type=str,
                          "try to create it first.")
 parser.add_argument('--genome', type=str,
                     help="Path to STAR reference genome index directory.")
+parser.add_argument('--genome_fasta', type=str,
+                    help="Path to genome fasta file.")
 parser.add_argument('--repeat', type=str,
                     help="Path to STAR repeat elements index directory.")
 parser.add_argument('--track', type=str,
@@ -115,6 +117,11 @@ def parse_and_sanitize_options():
         except OSError:
             raise OSError(f'Outdir {options.outdir} does not exist and cannot be created!')
     setattr(options, 'genome', options.genome or manifest.get('genome', ''))
+    if not os.path.isdir(options.genome):
+        raise ValueError(f'Reference genome index {options.genome} is not a directory or does not exist.')
+
+    setattr(options, 'genome_fasta', 
+            options.genome_fasta or manifest.get('genome_fasta', '') or os.path.join(options.genome, 'genome.fa'))
     if not os.path.isdir(options.genome):
         raise ValueError(f'Reference genome index {options.genome} is not a directory or does not exist.')
     
@@ -803,7 +810,15 @@ container multiWig
     logger.info(message)
 
 
+def check_file_exists(input_file, output_file):
+    if not os.path.exists(output_file):
+        return True, f'Missing file {output_file}'
+    else:
+        return False, f'File {output_file} exists'
+
+
 @ruffus.jobs_limit(1)
+@ruffus.check_if_uptodate(check_file_exists)
 @ruffus.follows(make_hub_files)
 @ruffus.transform([read.bam for read in READS.values() if read.type == 'IP'],
                   ruffus.suffix('.bam'), '.peak.clusters.bed')
@@ -814,12 +829,13 @@ def clipper(bam, bed):
 
 @ruffus.jobs_limit(1)
 @ruffus.follows(clipper)
+@ruffus.check_if_uptodate(check_file_exists)
 @ruffus.transform([read.bam for read in READS.values() if read.type == 'IP'],
                   ruffus.suffix('.bam'), '.crosslink.sites.bed')
 def pureclip(bam, bed):
     ip_bam, input_bam = [[sample.ip_read.bam, sample.input_read.bam] for sample in SAMPLES
                          if sample.ip_read.bam == bam][0]
-    cmd = ['pureclip', '-i', ip_bam, '-bai', f'{ip_bam}.bai', '-g', f'{options.genome}/genome.fa',
+    cmd = ['pureclip', '-i', ip_bam, '-bai', f'{ip_bam}.bai', '-g', f'{options.genome_fasta}',
            '-iv', "'chr1;chr2;chr3'", '-nt', options.cores, '-ibam', input_bam, '-ibai', f'{input_bam}.bai',
            '-o', bed, '-or', bed.replace('.crosslink.sites.bed', '.binding.regions.bed'),
            '>', bed.replace('.crosslink.sites.bed', '.pureclip.log')]
