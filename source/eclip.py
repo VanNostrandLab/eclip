@@ -178,21 +178,29 @@ class Read:
         self.bed = f'{ECLIP}/{self.key}.peak.clusters.bed' if read_type == 'ip' else ''
         self.full_bed = f'{ECLIP}/{self.key}.peak.clusters.full.bed' if read_type == 'ip' else ''
         self.normalized_bed = f'{ECLIP}/{self.key}.peak.clusters.normalized.bed' if read_type == 'ip' else ''
+        self.normalized_full_bed = f'{ECLIP}/{self.key}.peak.clusters.normalized.full.bed' if read_type == 'ip' else ''
         self.compressed_bed = f'{ECLIP}/{self.key}.peak.clusters.compressed.bed' if read_type == 'ip' else ''
+        self.compressed_full_bed = f'{ECLIP}/{self.key}.peak.clusters.compressed.full.bed' if read_type == 'ip' else ''
         self.entropy_bed = f'{ECLIP}/{self.key}.peak.clusters.entropy.bed' if read_type == 'ip' else ''
+        self.entropy_full_bed = f'{ECLIP}/{self.key}.peak.clusters.entropy.full.bed' if read_type == 'ip' else ''
 
 
 class Sample:
     def __init__(self, ip_read, input_read, index_number):
-        self.ip_read = Read(ip_read, 'ip')
-        self.input_read = Read(input_read, 'input')
-        self.peak_bed = self.ip_read.bed
-        self.peak_full_bed = self.ip_read.full_bed
-        self.peak_normalized_bed = self.ip_read.normalized_bed
-        self.peak_compressed_bed = self.ip_read.compressed_bed
-        self.peak_entropy_bed = self.ip_read.entropy_bed
+        self.ip_read = ip_read
+        self.input_read = input_read
+        self.bed = self.ip_read.bed
+        self.full_bed = self.ip_read.full_bed
+        self.normalized_bed = self.ip_read.normalized_bed
+        self.normalized_full_bed = self.ip_read.normalized_full_bed
+        self.compressed_bed = self.ip_read.compressed_bed
+        self.compressed_full_bed = self.ip_read.compressed_full_bed
+        self.entropy_bed = self.ip_read.entropy_bed
+        self.entropy_full_bed = self.ip_read.entropy_full_bed
         self.idr_bed = f'{ECLIP}/01v02.idr.out.bed'
-        self.idr_merged_bed = f'{ECLIP}/01v02.idr.out.0102.merged.{index_number}.bed'
+        self.idr_merged_bed = f'{ECLIP}/01v02.idr.out.0102.merged.{index_number:02d}.bed'
+        self.idr_merged_full_bed = f'{ECLIP}/01v02.idr.out.0102.merged.{index_number:02d}.full.bed'
+        self.reproducible_full_bed = f'{ECLIP}/reproducible.peaks.{index_number:02d}.full.bed'
 
 
 def size(file, formatting=True):
@@ -857,7 +865,7 @@ def calculate_entropy(bed, output):
     df['qi'] = df['input_read_number'] / input_mapped_read_count
     df['entropy'] = df.apply(lambda row: 0 if row.pi <= row.qi else row.pi * math.log2(row.pi / row.qi), axis=1)
     df['excess_reads'] = df['pi'] - df['qi']
-    entropy = output.replace('.entropy.bed', '.entropy.tsv')
+    entropy = output.replace('.entropy.bed', '.entropy.full.bed')
     df.to_csv(entropy, index=False, columns=columns + ['entropy'], sep='\t', header=False)
     excess_read = output.replace('.entropy.tsv', 'excess.reads.entropy.tsv')
     df.to_csv(excess_read, index=False, columns=columns + ['excess_reads'], sep='\t', header=False)
@@ -879,14 +887,14 @@ def idr_peaks(inputs, output):
     cmd = ['idr', '--sample', peak1, peak2, '--input-file-type', 'bed', '--rank', 5,
            '--peak-merge-method', 'max', '--plot', '-o', idr_out]
     cmding(cmd, message=f'Running IDR to rank peaks in {peak1} and\n{" " * 40}{peak2} ...')
-    cmd = ['parse_idr_peaks.pl', idr_out, peak1.replace('.bed', '.tsv'), peak2.replace('.bed', '.tsv'), output]
+    cmd = ['parse_idr_peaks.pl', idr_out,
+           peak1.replace('.bed', '.full.bed'), peak2.replace('.bed', '.full.bed'), output]
     cmding(cmd, message=f'Parsing IDR peaks in {idr_out} ...')
 
 
-@ruffus.transform(idr_peaks, ruffus.suffix('.idr.out.bed'), '.idr.out.bed.overlapped')
+@ruffus.transform(idr_peaks, ruffus.suffix('.idr.out.bed'), '.idr.out.bed.overlap.done')
 def overlap_idr_peaks(idr_peak_bed, output):
-    for i, sample in SAMPLES:
-        bed = idr_peak_bed.replace('.bed', f'.01020.merged.0{i}.bed')
+    for sample in SAMPLES:
         cmd = ['overlap_peak.pl', sample.ip_read.bam, sample.input_read.bam, idr_peak_bed,
                mapped_read_count(sample.ip_read.bam), mapped_read_count(sample.input_read.bam), 
                sample.idr_merged_bed]
@@ -895,28 +903,22 @@ def overlap_idr_peaks(idr_peak_bed, output):
         o.write('')
 
 
+@ruffus.transform(overlap_idr_peaks, ruffus.suffix('.idr.out.bed.overlap.done'), '.idr.reproducible.peaks.done')
 def reproducible_peaks(file, output):
-    pass
-    cmd = ['reproducible_peaks.pl',
-           file.replace('.bed.overlapped', '0102.merged.01.full.bed'),
-           file.replace('.bed.overlapped', '0102.merged.02.full.bed'),
-           f'{ECLIP}/reproducible.peaks.01.full.bed',
-           f'{ECLIP}/reproducible.peaks.02.full.bed',
+    sample1, sample2 = SAMPLES
+    cmd = [sample1.idr_merged_full_bed,
+           sample2.idr_merged_full_bed,
+           sample1.reproducible_full_bed,
+           sample2.reproducible_full_bed,
            f'{ECLIP}/reproducible.peaks.bed',
            f'{ECLIP}/reproducible.peaks.custom.bed',
-           ]
-    """
-    get_reproducing_peaks.pl \
-    01v02.IDR.out.0102merged.01.bed.full \
-    01v02.IDR.out.0102merged.02.bed.full \
-    reproducible_peaks.01.bed.full \
-    reproducible_peaks.02.bed.full \
-    reproducible_peaks.bed \
-    reproducible_peaks.custombed \
-    rep1_normed_peaks.compressed.bed.entropy.full \
-    rep2_normed_peaks.compressed.bed.entropy.full \
-    01v02.idr.out
-    """
+           sample1.entropy_full_bed,
+           sample2.entropy_full_bed,
+           f'{ECLIP}/01v02.idr.out']
+    cmd = 'reproducible_peaks.pl \\\n  ' + ' \\\n  '.join(cmd)
+    cmding(cmd, message='Identifying reproducible peaks ...')
+    with open(output, 'w') as o:
+        o.write('')
 
     
 def sort_compressed_peaks():
