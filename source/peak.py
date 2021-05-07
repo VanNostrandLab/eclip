@@ -100,27 +100,22 @@ def calculate_entropy(bed, output):
     return output
 
 
-@task(inputs=[], parent=calculate_entropy, outputs=f'task.idr.peaks.done', kind='create',
-      processes=args.cores,)
+@task(inputs=[], parent=calculate_entropy, kind='create', processes=args.cores,
+      outputs=[f'{key1}.vs.{key2}.idr.out.bed' for key1, key2 in itertools.combinations(data.keys(), 2)])
 def idr_peaks(inputs, outputs):
-    idr_beds = []
-    for key1, key2 in itertools.combinations(data.keys(), 2):
-        idr_out = f'{key1}.vs.{key2}.idr.out'
-        idr_bed = f'{key1}.vs.{key2}.idr.out.bed'
-
-        peak1 = f'{key1}.peak.clusters.normalized.compressed.annotated.entropy.bed'
-        peak2 = f'{key2}.peak.clusters.normalized.compressed.annotated.entropy.bed'
-        cmd = ['idr', '--sample', peak1, peak2, '--input-file-type', 'bed', '--rank', '5',
-               '--peak-merge-method', 'max', '--plot', '-o', idr_out]
-        cmder.run(cmd, msg=f'Running IDR to rank peaks in {peak1} and\n{" " * 40}{peak2} ...', pmt=True)
-        
-        cmd = ['parse_idr_peaks.pl', idr_out,
-               peak1.replace('.bed', '.full.bed'), peak2.replace('.bed', '.full.bed'), idr_bed]
-        cmder.run(cmd, msg=f'Parsing IDR peaks in {idr_out} ...', pmt=True)
-        idr_beds.append(idr_bed)
-    with open(outputs, 'w') as o:
-        o.write('')
-    return idr_beds
+    key1, key2 = outputs.replace('.idr.out.bed', '').split('.vs.')
+    idr_out = f'{key1}.vs.{key2}.idr.out'
+    idr_bed = outputs
+    
+    peak1 = f'{key1}.peak.clusters.normalized.compressed.annotated.entropy.bed'
+    peak2 = f'{key2}.peak.clusters.normalized.compressed.annotated.entropy.bed'
+    cmd = ['idr', '--sample', peak1, peak2, '--input-file-type', 'bed', '--rank', '5',
+           '--peak-merge-method', 'max', '--plot', '-o', idr_out]
+    cmder.run(cmd, msg=f'Running IDR to rank peaks in {peak1} and\n{" " * 40}{peak2} ...', pmt=True)
+    
+    cmd = ['parse_idr_peaks.pl', idr_out,
+           peak1.replace('.bed', '.full.bed'), peak2.replace('.bed', '.full.bed'), idr_bed]
+    cmder.run(cmd, msg=f'Parsing IDR peaks in {idr_out} ...', pmt=True)
 
 
 @task(inputs=[], parent=idr_peaks, kind='create', outputs=f'{".vs.".join(data.keys())}.idr.out.bed',
@@ -165,8 +160,6 @@ def reproducible_peaks(inputs, outputs):
     cmd += [outputs.replace('.reproducible.peaks.bed', '.idr.out')]
     cmder.run(cmd, msg='Identifying reproducible peaks ...', pmt=True)
     
-    os.unlink('task.idr.peaks.done')
-
 
 def main():
     flow = Flow('Peak', description=__doc__.strip())
