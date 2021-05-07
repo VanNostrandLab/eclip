@@ -13,11 +13,11 @@ unless ($ARGV[0] && $ARGV[1] && $ARGV[2] && $ARGV[3]) {
     exit;
 }
 my $l2fc_cutoff = 3;
-unless ($ARGV[4]) {
+if (exists $ARGV[4]) {
     $l2fc_cutoff = $ARGV[4];
 }
 my $l10p_cutoff = 3;
-unless ($ARGV[5]) {
+if (exists $ARGV[5]) {
     $l10p_cutoff = $ARGV[5];
 }
 

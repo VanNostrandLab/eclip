@@ -51,11 +51,11 @@ for my $chrom (keys %read_hash) {
 					next if ($p1stop <= $p2start);
 
 					if ($p1l10p >= $p2l10p) {
-						print STDERR "Comparing $peak1 and $peak, $peak was discarded\n" if ($verbose_flag == 1);
+						# print STDERR "Comparing $peak1 and $peak, $peak was discarded\n" if ($verbose_flag == 1);
 						$discard_peaks{$peak} = 1;
 					} else {
 						$discard_peaks{$peak1} = 1;
-						print STDERR "Comparing $peak1 and $peak, $peak1 was discarded\n" if ($verbose_flag == 1);
+						# print STDERR "Comparing $peak1 and $peak, $peak1 was discarded\n" if ($verbose_flag == 1);
 					}
 				}
 			}
@@ -65,6 +65,9 @@ for my $chrom (keys %read_hash) {
 			next if (exists $discard_peaks{$peak});
 			my ($p1chrom,$p1position,$p1strand,$p1l10p,$p1l2fc) = split(/\:/, $peak);
 				my ($p1start, $p1stop) = split(/\-/, $p1position);
+			# if ($p1l2fc > 0) {
+			# 	print O "$p1chrom\t$p1start\t$p1stop\t$p1l10p\t$p1l2fc\t$p1strand\n";
+			# }
 			print O "$p1chrom\t$p1start\t$p1stop\t$p1l10p\t$p1l2fc\t$p1strand\n";
 			print FULL "".$long_lines{$p1chrom.":".$p1position.":".$p1strand}."\n";
 		}

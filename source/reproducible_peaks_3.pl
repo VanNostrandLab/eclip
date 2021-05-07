@@ -3,9 +3,6 @@
 use warnings;
 use strict;
 
-print $ARGV[4];
-print $ARGV[5];
-
 my $hashing_value = 10000;
 my $l2fc_cutoff = 3;
 my $l10p_cutoff = 3;
@@ -17,31 +14,37 @@ my %idr_cutoffs = ("0.001" => "1000", "0.005" => "955", "0.01" => "830", "0.02" 
 
 my $rep1_idr_merged_full_bed = $ARGV[0];
 my $rep2_idr_merged_full_bed = $ARGV[1];
+my $rep2_idr_merged_full_bed = $ARGV[2];
 
-my $rep1_full_out = $ARGV[2];
-my $rep2_full_out = $ARGV[3];
+my $rep1_full_out = $ARGV[3];
+my $rep2_full_out = $ARGV[4];
+my $rep2_full_out = $ARGV[5];
 open(REP1FULL,">$rep1_full_out") || die "Cannot open $rep1_full_out for writing!\n";
 open(REP2FULL,">$rep2_full_out") || die "Cannot open $rep2_full_out for writing!\n";
+open(REP3FULL,">$rep3_full_out") || die "Cannot open $rep3_full_out for writing!\n";
 
-my $bed_output = $ARGV[4];
-my $custom_bed_output = $ARGV[5];
+my $bed_output = $ARGV[6];
+my $custom_bed_output = $ARGV[7];
 open(BEDOUT,">$bed_output") || die "Cannot open $bed_output for writing!\n";
 open(CUSTOMOUT,">$custom_bed_output") || die "Cannot open $custom_bed_output for writing!\n";
 
-my $idr_file = $ARGV[8];
+my $file1 = $ARGV[8];
+my $file2 = $ARGV[9];
+my $file3 = $ARGV[10];
+
+my $idr_file = $ARGV[11];
 my %idr_output;
 &parse_idr_file($idr_file);
-
-my $file1 = $ARGV[6];
-my $file2 = $ARGV[7];
 
 my %idr_region2peaks;
 &parse_file($file1);
 &parse_file($file2);
+&parse_file($file3);
 my %peak_info;
 
 &parse_input_norm_full_file($rep1_idr_merged_full_bed);
 &parse_input_norm_full_file($rep2_idr_merged_full_bed);
+&parse_input_norm_full_file($rep3_idr_merged_full_bed);
 
 
 my $count_significant=0;
@@ -97,6 +100,11 @@ for my $idr_region (keys %idr_region2peaks) {
 	my $rep2_full_join = join("\t",@rep2_full);
         print REP2FULL "".$rep2_full_join."\n";
 
+    my @rep3_full = split(/\t/,$peak_info{$peak}{$rep3_idr_merged_full_bed}{full});
+    $rep3_full[3] .= ":".$peak_geo_mean{$peak};
+    my $rep3_full_join = join("\t",@rep3_full);
+    print REP3FULL "".$rep3_full_join."\n";
+
         $count_significant++ if ($peak_geo_mean{$peak} >= 3);
     }
     for my $peak (@peaks_sorted) {
@@ -139,12 +147,18 @@ for my $idr_region (keys %idr_region2peaks) {
 	$rep2_full[3] .= ":".$peak_geo_mean{$peak};
 	my $rep2_full_join = join("\t",@rep2_full);
         print REP2FULL "".$rep2_full_join."\n";
+
+    my @rep3_full = split(/\t/,$peak_info{$peak}{$rep3_idr_merged_full_bed}{full});
+    $rep3_full[3] .= ":".$peak_geo_mean{$peak};
+    my $rep3_full_join = join("\t",@rep3_full);
+    print REP2FULL "".$rep3_full_join."\n";
     }
 }
 
-# print STDERR "IDR and geometric mean(fc) >= 3 && p-value >= 3 in both reps: $count_significant\n";
+print STDERR "IDR and geometric mean(fc) >= 3 && p-value >= 3 in both reps: $count_significant\n";
 close(REP1FULL);
 close(REP2FULL);
+close(REP3FULL);
 close(CUSTOMOUT);
 close(BEDOUT);
 
@@ -214,6 +228,7 @@ sub parse_file {
             my @sorted_idr = keys %overlapping_idrs;
             my $overlapping_idrpeak = $sorted_idr[0];
             my ($ichr,$ipos,$istr,$iidr) = split(/\:/,$overlapping_idrpeak);
+
             if ($iidr >= $idr_cutoffs{$idr_cutoff}) {
                 $idr_region2peaks{$overlapping_idrpeak}{$chr.":".$start."-".$stop.":".$str} = 1;
             }
