@@ -6,8 +6,9 @@ A pipeline for processing eCLIP data to identify genomic locations of RNA bindin
 """
 
 import argparse
-import glob
 import os
+import glob
+import sys
 import time
 import subprocess
 import json
@@ -15,11 +16,11 @@ import yaml
 import datetime
 import tempfile
 import shutil
-import math
 import itertools
-import pysam as pysam
-import pandas as pd
+import math
+import pysam
 import cmder
+import pandas as pd
 from seqflow import Flow, task, logger
 
 
@@ -110,9 +111,9 @@ def parse_and_sanitize_options():
     setattr(options, 'barcodes_fasta', options.barcodes_fasta or manifest.get('barcodes_fasta', barcodes_fasta))
     if not os.path.isfile(options.barcodes_fasta):
         raise ValueError(f'Barcodes fasta {options.barcodes_fasta} is not a file or does not exist.')
-    
+
     setattr(options, 'randomer_length', options.randomer_length or manifest.get('randomer_length', '5'))
-    
+
     blacklist_bed = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hg19.blacklist.bed')
     setattr(options, 'blacklist_bed', options.blacklist_bed or manifest.get('blacklist_bed', blacklist_bed))
     if not os.path.isfile(options.blacklist_bed):
@@ -123,7 +124,7 @@ def parse_and_sanitize_options():
     setattr(options, 'track', options.track or options.dataset or 'eCLIP')
     setattr(options, 'track_label', options.track or options.dataset or 'eCLIP')
     setattr(options, 'track_genome', options.species or manifest.get('species', 'hg19'))
-    
+
     return options
 
 
@@ -266,24 +267,14 @@ def soft_link(fastq1, link1):
     return link1
 
 
-def prepare_reads_outputs(expand=False):
-    outputs = set()
-    for r in READS.values():
-        barcodes = r.barcodes if r.paired else ['umi', 'umi']
-        outputs.add(f'{ECLIP}/{r.key}.{barcodes[0]}.r1.fastq.gz')
-        if expand:
-            outputs.add(f'{ECLIP}/{r.key}.{barcodes[1]}.r1.fastq.gz')
-    return list(outputs)
+def umi_extract_or_barcode_demux(link):
+    key = os.path.basename(link).replace('.r1.fastq.gz', '')
+    read = READS[key]
+    barcode = read.barcodes[0] if read.paired else 'umi'
+    return f'{ECLIP}/{key}.{barcode}.r1.fastq.gz'
 
 
-def prepare_reads_cleanup():
-    kps = prepare_reads_outputs(expand=True) + [r.link1 for r in READS.values()] + [r.link2 for r in READS.values()]
-    rms = [p for p in glob.iglob(f'{ECLIP}/*.fastq.gz') if p not in kps]
-    return rms
-
-
-@task(inputs=soft_link, outputs=prepare_reads_outputs(),
-      checkpoint=False, processes=options.cores, cleanup_after_run=prepare_reads_cleanup())
+@task(inputs=soft_link, outputs=lambda i: umi_extract_or_barcode_demux(i), processes=options.cores)
 def prepare_reads(link, output):
     """Extract UMIs for single-end reads or demultiplex paired-end reads."""
     read = READS[os.path.basename(link.replace('.r1.fastq.gz', ''))]
@@ -291,16 +282,12 @@ def prepare_reads(link, output):
     if fastq2:
         barcodes = read.barcodes
         message = f'Demultiplexing paired-end reads {fastq1} {size(fastq1)} and\n{" " * 43}{fastq2} {size(fastq2)} ...'
-        cmd = ['demux',
-               '--fastq_1', os.path.basename(fastq1),
-               '--fastq_2', os.path.basename(fastq2),
-               '--newname', read.name,
-               '--expectedbarcodeida', barcodes[0],
-               '--expectedbarcodeidb', barcodes[1],
-               '--barcodesfile', options.barcodes_fasta,
-               '--length', options.randomer_length,
-               '--metrics', f'{options.dataset}.{read.name}.demux.metrics']
-        cmder.run(cmd, msg=message, pmt=True, cwd=os.path.join(options.outdir, ECLIP))
+        cmd = ['fastd.py',
+               '--fastqs', fastq1, fastq2,
+               '--barcodes', barcodes[0], barcodes[1],
+               '--basename', fastq1.replace('.r1.fastq.gz', ''),
+               '--randomer_length', options.randomer_length, '--gz']
+        cmder.run(cmd, msg=message, pmt=True)
     else:
         message = f'Extract UMIs for single-end read {fastq1} {size(fastq1)} ...'
         cmd = ['umi_tools', 'extract',
@@ -312,11 +299,17 @@ def prepare_reads(link, output):
         cmder.run(cmd, msg=message, pmt=True)
 
 
-@task(inputs=prepare_reads_outputs(expand=True), outputs=lambda i: i.replace('.r1.fastq.gz', '.trim.r1.fastq'),
-      parent=prepare_reads,
-      cleanup_after_run=[i.replace('.trim.', '.clean,') for i in prepare_reads_outputs(expand=True)] +
-                        [i.replace('.trim.', '.clean,').replace('.r1.', '.r2.')
-                         for i in prepare_reads_outputs(expand=True)])
+def umi_extract_or_barcode_demux_outputs():
+    outputs = set()
+    for r in READS.values():
+        barcodes = r.barcodes if r.paired else ['umi', 'umi']
+        for barcode in barcodes:
+            outputs.add(f'{ECLIP}/{r.key}.{barcode}.r1.fastq.gz')
+    return list(outputs)
+
+
+@task(inputs=umi_extract_or_barcode_demux_outputs(), outputs=lambda i: i.replace('.r1.fastq.gz', '.trim.r1.fastq.gz'),
+      parent=prepare_reads)
 def cut_adapt(r1, fastq):
     def parse_adapters(flag, fasta):
         adapters = []
@@ -338,7 +331,7 @@ def cut_adapt(r1, fastq):
             overlap1, overlap2 = '1', '5'
         else:
             cmd = ['parse_barcodes.sh', options.randomer_length, options.barcodes_fasta] + read.barcodes
-            folder = tempfile.mkdtemp(dir=os.path.join(options.outdir, 'eclip'))
+            folder = tempfile.mkdtemp(dir=ECLIP)
             cmder.run(cmd, msg='Parsing barcodes and finding adapters ...', cwd=folder)
             adapters = parse_adapters('-a', os.path.join(folder, 'a_adapters.fasta'))
             adapters += parse_adapters('-A', os.path.join(folder, 'A_adapters.fasta'))
@@ -355,7 +348,7 @@ def cut_adapt(r1, fastq):
             tmp = out1.replace('.trim.', '.clean.')
             ios1 = ['-o', tmp, input1, '>', out1.replace('.r1.trim.fastq', '.trim.first.metrics')]
             msg1 = f"Cutting adapters for single read {input1} {size(input1)} (first round) ..."
-            
+
             ios2 = ['-o', out1, tmp, '>', out1.replace('.r1.clean.fastq', '.trim.second.metrics')]
             msg2 = f"Cutting adapters for single read {tmp} {size(tmp)} (second round) ..."
         else:
@@ -386,25 +379,31 @@ def cut_adapt(r1, fastq):
     return fastq
 
 
-@task(inputs=cut_adapt, outputs=lambda i: i.replace('.trim.r1.fastq', '.trim.sort.r1.fastq'), processes=options.cores)
+@task(inputs=cut_adapt, outputs=lambda i: i.replace('.trim.r1.', '.trim.sort.r1.'), processes=options.cores)
 def sort_fastq(fastq, output):
-    cmd = ['fastq-sort', '--id', fastq, '>', output]
-    cmder.run(cmd, msg=f'Sort fastq {fastq} {size(fastq)} ...', pmt=True)
+    tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=ECLIP)
+    cmd = f'zcat {fastq} | fastq-sort --id --temporary-directory {tmp} -S 2G | gzip > {output}'
+    stdout, stderr = cmder.run(cmd, msg=f'Sorting {fastq} {size(fastq)} ...', fmt_cmd=False)
+    print(stdout or stderr)
+    cmder.run(f'rm -r {tmp}')
 
     fastq2 = fastq.replace('.r1.', '.r2.')
     if os.path.isfile(fastq2):
-        output2 = output.replace('.r1.clean.sort.fastq', '.r2.clean.sort.fastq')
-        cmd = ['fastq-sort', '--id', fastq2, '>', output2]
-        cmder.run(cmd, msg=f'Sort fastq {fastq2} {size(fastq2)} ...', pmt=True)
+        output2 = output.replace('.r1.', '.r2.')
+        tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=ECLIP)
+        cmd = f'zcat {fastq2} | fastq-sort --id --temporary-directory {tmp} -S 2G | gzip >  {output2}'
+        cmder.run(cmd, msg=f'Sort fastq {fastq2} {size(fastq2)} ...', fmt_cmd=False)
+        print(stdout or stderr)
+        cmder.run(f'rm -r {tmp}')
     return output
 
 
-@task(inputs=[i.replace('.r1.fastq.gz', '.trim.sort.r1.fastq') for i in prepare_reads_outputs(expand=True)],
+@task(inputs=[i.replace('.r1.', '.trim.sort.r1.') for i in umi_extract_or_barcode_demux_outputs()],
       parent=sort_fastq, mkdir_before_run=[f'{ECLIP}/repeat.elements.map'],
-      outputs=lambda i: (f'{ECLIP}/repeat.elements.map/{os.path.basename(i).replace(".trim.sort.r1.fastq", "")}'
+      outputs=lambda i: (f'{ECLIP}/repeat.elements.map/{os.path.basename(i).replace(".trim.sort.r1.fastq.gz", "")}'
                          f'/Unmapped.out.mate1'))
 def map_to_repeat_elements(fastq, mate1):
-    fastq1, fastq2 = fastq, fastq.replace('.trim.sort.r1.fastq', '.trim.sort.r2.fastq')
+    fastq1, fastq2 = fastq, fastq.replace('.r1.', '.r2.')
     prefix = os.path.dirname(mate1)
     if not os.path.isdir(prefix):
         os.mkdir(prefix)
@@ -427,6 +426,7 @@ def map_to_repeat_elements(fastq, mate1):
            '--outSAMtype', 'BAM', 'Unsorted',
            '--outSAMunmapped', 'Within',
            '--outStd', 'Log',
+           '--readFilesCommand', 'zcat',
            '--readFilesIn', fastq1]
     if os.path.exists(fastq2):
         cmd.append(fastq2)
@@ -440,14 +440,18 @@ def map_to_repeat_elements(fastq, mate1):
 
 @task(map_to_repeat_elements, lambda i: i.replace('.out.mate1', '.out.sort.mate1'), processes=options.cores)
 def sort_mate(mate1, output):
-    cmd = ['fastq-sort', '--id', mate1, '>', output]
-    cmder.run(cmd, msg=f'Sort mate1 {mate1} {size(mate1)} ...', pmt=True)
+    tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=os.path.dirname(mate1))
+    cmd = f'fastq-sort --id --temporary-directory {tmp} -S 2G {mate1} > {output}'
+    cmder.run(cmd, msg=f'Sort mate1 {mate1} {size(mate1)} ...', fmt_cmd=False)
+    cmder.run(f'rm -r {tmp}')
 
-    mate2, output2 = mate1.replace('.mate1', '.mate2'), output.replace('.mate1', '.mate2')
+    mate2 = mate1.replace('.mate1', '.mate2')
     if os.path.isfile(mate2):
-        output2 = output.replace('.out.mate1.sort.fastq', '.out.mate2.sort.fastq')
-        cmd = ['fastq-sort', '--id', mate2, '>', output2]
-        cmder.run(cmd, msg=f'Sort mate2 {mate2} {size(mate2)} ...', pmt=True)
+        output2 = output.replace('.mate1', '.mate2')
+        tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=os.path.dirname(mate1))
+        cmd = f'fastq-sort --id --temporary-directory {tmp} -S 2G {mate2} > {output2}'
+        cmder.run(cmd, msg=f'Sort mate2 {mate2} {size(mate2)} ...', fmt_cmd=False)
+        cmder.run(f'rm -r {tmp}')
     return output
 
 
@@ -583,7 +587,7 @@ def make_bigwig_files(bam, bigwig):
         cmd = f'bedGraphToBigWig {bg_sort} {options.genome}/chrNameLength.txt {bw}'
         cmder.run(cmd)
         cmder.run(f'rm {bg}')
-    
+
     message, start_time = f'Make BigWig files for {bam} ...', time.perf_counter()
     logger.info(message)
     pos_bw, neg_bw = bigwig, bigwig.replace('.plus.bw', '.minus.bw')
@@ -597,7 +601,7 @@ def make_bigwig_files(bam, bigwig):
         with open(bigwig, 'w') as o:
             o.write('')
         return bigwig
-    if options.strand_direction in ('f', 'forward'):
+    if TYPE == 'single':
         bam_to_bigwig(bam, scale, '+', pos_bw)
         bam_to_bigwig(bam, -1 * scale, '-', neg_bw)
     else:
@@ -647,7 +651,7 @@ container multiWig
     type bigWig
     color 0,100,0
     parent {basename}
-    
+
     track {name2}
     bigDataUrl {minus}
     shortLabel {basename} Minus strand
@@ -656,7 +660,7 @@ container multiWig
     color 0,100,0
     parent {basename}
     """
-    
+
     track = options.track.replace(' ', '_')
     with open(output, 'w') as o:
         o.write(header)
@@ -670,19 +674,24 @@ container multiWig
     run_time = int(time.perf_counter() - start_time)
     message = message.replace(' ...', f' completed in [{str(datetime.timedelta(seconds=run_time))}].')
     logger.info(message)
-    
-    
-def call_peaks(bam, bed=''):
+
+
+def clipper_peaks(bam, bed=''):
     bed = bed if bed else bam.replace('.bam', '.peak.clusters.bed')
-    cmd = f'clipper --species {options.species} --processors {options.cores} --bam {bam} --outfile {bed}'
-    cmder.run(cmd, msg=f'Calling peaks from {bam} {size(bam)} using clipper ...', pmt=True)
+    print('before', bed, os.path.isfile(bed))
+    if os.path.isfile(bed):
+        logger.info(f'Clipper bed {bed} already exists.')
+    else:
+        cmd = f'clipper --species {options.species} --processors {options.cores} --bam {bam} --outfile {bed}'
+        cmder.run(cmd, msg=f'Calling peaks from {bam} {size(bam)} using clipper ...', pmt=True)
+    print('after', bed, os.path.isfile(bed))
     return bed
 
 
 @task(inputs=[read.bam for read in READS.values() if read.type == 'IP'],
       outputs=lambda i: i.replace('.bam', '.peak.clusters.bed'), parent=index_bam)
 def clipper(bam, bed):
-    return call_peaks(bam, bed)
+    return clipper_peaks(bam, bed)
 
 
 @task(inputs=[read.bam for read in READS.values() if read.type == 'IP'],
@@ -697,46 +706,187 @@ def pureclip(bam, bed):
     cmder.run(cmd, msg=f'Calling peaks from {bam} {size(bam)} using pureCLIP ...', pmt=True)
 
 
-@task(inputs=[], outputs=f'{".vs.".join([s.key for s in SAMPLES])}.reproducible.peaks.bed', parent=clipper)
-def reproducible_peaks(inputs, outputs):
-    ip_bams, input_bams, peak_beds = ['--ip_bams'], ['--input_bams'], ['--peak_beds']
-    for sample in SAMPLES:
-        input_bams.append(sample.ip_read.bam)
-        input_bams.append(sample.input_read.bam)
-        input_bams.append(sample.bed)
-    cmd = ['peak.py'] + ip_bams + input_bams + peak_beds
-    cmd += ['--cores', options.cores] + ['--species', options.species] + ['--outdir', options.outdir]
-    cmd.run(cmd)
-    
-    
-def split_bam(bam, bam1, bam2):
+def mapped_read_count(bam):
     with pysam.AlignmentFile(bam, 'rb') as sam:
-        half_lines = int(sam.mapped / 2)
-    cmd = f'samtools view {bam} | shuf | split -d -I {half_lines} - {bam}'
-    cmder.run(cmd, msg=f'Shuffling and splitting {bam} ...')
-    
-    cmd = f'samtools view -H {bam} | cat - {bam}00 | samtools view -bS - > {bam1}'
-    cmder.run(cmd, msg=f'Adding headers for {bam1} ...')
-    cmd = f'samtools view -H {bam} | cat - {bam}00 | samtools view -bS - > {bam2}'
-    cmder.run(cmd, msg=f'Adding headers for {bam2} ...')
+        return sam.mapped
+
+
+def calculate_entropy(bed, output, ip_read_count, input_read_count):
+    logger.info(f'Calculating entropy for {bed} ...')
+    # name = bed.replace('.peak.clusters.normalized.compressed.annotated.full.bed', '')
+    # ip_bam, input_bam, peak_bed = data[name]
+    # ip_mapped_read_count, input_mapped_read_count = mapped_read_count(ip_bam), mapped_read_count(input_bam)
+    columns = ['chrom', 'start', 'end', 'peak', 'ip_read_number', 'input_read_number',
+               'p', 'v', 'method', 'status', 'l10p', 'l2fc',
+               'ensg_overlap', 'feature_type', 'feature_ensg', 'gene', 'region']
+    df = pd.read_csv(bed, sep='\t', header=None, names=columns)
+    df = df[df.l2fc > 0]
+    df['pi'] = df['ip_read_number'] / ip_read_count
+    df['qi'] = df['input_read_number'] / input_read_count
+    if df.empty:
+        logger.error(f'No valid peaks found in {bed} (l2fc > 0 failed).')
+        sys.exit(1)
+    df['entropy'] = df.apply(lambda row: 0 if row.pi <= row.qi else row.pi * math.log2(row.pi / row.qi), axis=1)
+    df['excess_reads'] = df['pi'] - df['qi']
+    entropy = output.replace('.entropy.bed', '.entropy.full.bed')
+    df.to_csv(entropy, index=False, columns=columns + ['entropy'], sep='\t', header=False)
+    excess_read = output.replace('.bed', 'excess.reads.tsv')
+    df.to_csv(excess_read, index=False, columns=columns + ['excess_reads'], sep='\t')
+    df['strand'] = df.peak.str.split(':', expand=True)[2]
+    df['l2fc'] = df['l2fc'].map('{:.15f}'.format)
+    df['entropy'] = df['entropy'].map('{:.10f}'.format)
+    # For IDR 2.0.2, columns 'excess_reads', 'pi', and 'qi' need to be excluded for .entropy.bed
+    # For IDR 2.0.3, columns 'excess_reads', 'pi', and 'qi' need to be retained for .entropy.bed
+    columns = ['chrom', 'start', 'end', 'l2fc', 'entropy', 'strand', 'excess_reads', 'pi', 'qi']
+    df.to_csv(output, index=False, columns=columns, sep='\t', header=False)
+    logger.info(f'Calculating entropy for {bed} complete.')
+    return output
+
+
+def peak(ip_bams, input_bams, peak_beds):
+    entropy_beds = {}
+    for ip_bam, input_bam, peak_bed in zip(ip_bams, input_bams, peak_beds):
+        logger.info(f'Processing {peak_bed} ...')
+        name = os.path.basename(peak_bed.replace('.peak.clusters.bed', ''))
+        normalized_bed = peak_bed.replace('.peak.clusters.bed', '.peak.clusters.normalized.bed')
+        ip_read_count, input_read_count = mapped_read_count(ip_bam), mapped_read_count(input_bam)
+        if os.path.isfile(normalized_bed):
+            logger.info(f'Normalized peaks {normalized_bed} already exist.')
+        else:
+            cmd = ['overlap_peak.pl', ip_bam, input_bam, peak_bed, ip_read_count, input_read_count, normalized_bed]
+            cmder.run(cmd, msg=f'Normalizing peaks in {peak_bed} ...', pmt=True)
+
+        compressed_bed = normalized_bed.replace('.normalized.bed', '.normalized.compressed.bed')
+        if os.path.isfile(compressed_bed):
+            logger.info(f'Compressed peaks {compressed_bed} already exist.')
+        else:
+            cmd = ['compress_peak.pl', normalized_bed, compressed_bed]
+            cmder.run(cmd, msg=f'Compressing peaks in {normalized_bed} ...', pmt=True)
+
+        annotated_bed = compressed_bed.replace('.compressed.bed', '.compressed.annotated.full.bed')
+        if os.path.isfile(annotated_bed):
+            logger.info(f'Annotated peaks {annotated_bed} already exist.')
+        else:
+            species = 'hg19' if options.species == 'hg19chr19' else options.species
+            cmd = ['annotate_peak.pl', compressed_bed, annotated_bed, species, 'full']
+            cmder.run(cmd, msg=f'Annotating peaks in {compressed_bed} ...', pmt=True)
+
+        entropy_bed = annotated_bed.replace('.annotated.full.bed', '.annotated.entropy.bed')
+        annotated_bed = compressed_bed.replace('.compressed.bed', '.compressed.annotated.full.bed')
+        if os.path.isfile(entropy_bed):
+            logger.info(f'Entropy bed {annotated_bed} already exist.')
+        else:
+            calculate_entropy(annotated_bed, entropy_bed, ip_read_count, input_read_count)
+        entropy_beds[name] = entropy_bed.replace('.bed', '.full.bed')
+
+    for key1, key2 in itertools.combinations(entropy_beds.keys(), 2):
+        idr_out, idr_bed = f'{ECLIP}/{key1}.vs.{key2}.idr.out', f'{ECLIP}/{key1}.vs.{key2}.idr.out.bed'
+        entropy_bed1, entropy_bed2 = entropy_beds[key1], entropy_beds[key2]
+        if os.path.isfile(idr_out):
+            logger.info(f'IDR out {idr_out} already exist.')
+        else:
+            cmd = ['idr', '--sample', entropy_bed1, entropy_bed2, '--input-file-type', 'bed', '--rank', '5',
+                   '--peak-merge-method', 'max', '--plot', '-o', idr_out]
+            cmder.run(cmd, msg=f'Running IDR to rank peaks in {entropy_bed1} and\n{" " * 40}{entropy_bed2} ...',
+                      pmt=True)
+        if os.path.isfile(idr_bed):
+            logger.info(f'IDR bed {idr_bed} already exist.')
+        else:
+            cmd = ['parse_idr_peaks.pl', idr_out,
+                   entropy_bed1.replace('.bed', '.full.bed'), entropy_bed2.replace('.bed', '.full.bed'), idr_bed]
+            cmder.run(cmd, msg=f'Parsing IDR peaks in {idr_out} ...', pmt=True)
+
+    idr_bed = f'{ECLIP}/{".vs.".join(entropy_beds.keys())}.idr.out.bed'
+    if len(entropy_beds) == 2:
+        script = 'reproducible_peaks.pl'
+    elif len(entropy_beds) == 3:
+        script = 'reproducible_peaks_3.pl'
+        if os.path.isfile(idr_bed):
+            logger.info(f'IDR bed {idr_bed} already exist.')
+        else:
+            bed1, bed2, bed3 = [f'{ECLIP}/{key1}.vs.{key2}.idr.out.bed'
+                                for key1, key2 in itertools.combinations(entropy_beds.keys(), 2)]
+            cmder.run(f'bedtools intersect -a {bed1} -b {bed2} {bed3} > {idr_bed}', msg='Intersecting IDR beds ...')
+    else:
+        raise ValueError('Method for handeling more than 3 replicates has not been implemented yet.')
+
+    reproducible_bed = f'{ECLIP}/{".vs.".join(entropy_beds.keys())}.reproducible.peaks.bed'
+    if os.path.isfile(reproducible_bed):
+        logger.info(f'Reproducible peaks {reproducible_bed} already exist.')
+    else:
+        custom_bed = reproducible_bed.replace('.peaks.bed', '.peaks.custom.bed')
+        idr_normalized_full_beds, entropy_full_beds, reproducible_full_beds = [], [], []
+        for ip_bam, input_bam, peak_bed in zip(ip_bams, input_bams, peak_beds):
+            name = os.path.basename(peak_bed.replace('.peak.clusters.bed', ''))
+            idr_normalized_bed = f'{ECLIP}/{name}.idr.normalized.bed'
+            if os.path.isfile(idr_normalized_bed):
+                logger.info(f'IDR normalized bed {idr_normalized_bed} already exist.')
+            else:
+                cmd = ['overlap_peak.pl', ip_bam, input_bam, idr_bed,
+                       mapped_read_count(ip_bam), mapped_read_count(input_bam), idr_normalized_bed]
+                cmder.run(cmd, msg=f'Normalizing IDR peaks for sample {name} ...', pmt=True)
+            idr_normalized_full_beds.append(idr_normalized_bed.replace('.bed', '.full.bed'))
+            entropy_full_beds.append(f'{ECLIP}/{name}.peak.clusters.normalized.compressed.annotated.entropy.full.bed')
+            reproducible_full_beds.append(f'{ECLIP}/{name}.reproducible.peaks.full.bed')
+
+        cmd = [script, ] + idr_normalized_full_beds + reproducible_full_beds
+        cmd += [reproducible_bed, custom_bed] + entropy_full_beds
+        cmd += [reproducible_bed.replace('.reproducible.peaks.bed', '.idr.out')]
+        cmder.run(cmd, msg='Identifying reproducible peaks ...', pmt=True)
+
+
+# @task(inputs=[], outputs=f'{".vs.".join([s.key for s in SAMPLES])}.reproducible.peaks.bed', parent=clipper)
+def reproducible_peaks(inputs, outputs):
+    ip_bams, input_bams, peak_beds = [], [], []
+    for sample in SAMPLES:
+        ip_bams.append(sample.ip_read.bam)
+        input_bams.append(sample.input_read.bam)
+        peak_beds.append(sample.bed)
+    peak(ip_bams, input_bams, peak_beds)
+
+
+def split_bam(bam, bam1, bam2):
+    if os.path.isfile(bam1) and os.path.isfile(bam2):
+        logger.info(f'BAMs {bam1} and {bam2} already exist.')
+    else:
+        with pysam.AlignmentFile(bam, 'rb') as sam:
+            half_lines = int(sam.mapped / 2)
+        cmd = f'samtools view {bam} | shuf | split -d -l {half_lines} - {bam}'
+        cmder.run(cmd, msg=f'Shuffling and splitting {bam} ...')
+        tmp_bam1, tmp_bam2 = bam1.replace('.bam', '.tmp.bam'), bam2.replace('.bam', '.tmp.bam')
+        cmd = f'samtools view -H {bam} | cat - {bam}00 | samtools view -bS - > {tmp_bam1}'
+        cmder.run(cmd, msg=f'Creating headers for {bam1} ...')
+        cmder.run(f'samtools sort -@ {options.cores} -m 2G -o {bam1} {tmp_bam1}')
+        cmder.run(f'samtools index {bam1}')
+        cmd = f'samtools view -H {bam} | cat - {bam}00 | samtools view -bS - > {tmp_bam2}'
+        cmder.run(cmd, msg=f'Creating headers for {bam2} ...')
+        cmder.run(f'samtools sort -@ {options.cores} -m 2G -o {bam2} {tmp_bam2}')
+        cmder.run(f'samtools index {bam2}')
+        cmder.run(f'rm {tmp_bam1} {tmp_bam2}')
     return bam1, bam2
-    
-    
-@task(inputs=[], outputs=f'{ECLIP}/rescue.ratio.txt')
+
+
+@task(inputs=[], outputs=f'{ECLIP}/rescue.ratio.txt', parent=clipper)
 def rescue_ratio(inputs, outputs):
     def prepare_pseudo_bam(bam1, bam2, basename):
         pseudo_bam = f'{basename}.bam'
-        cmd = f'samtools merge {pseudo_bam} {bam1} {bam2}'
+        tmp_pseudo_bam = pseudo_bam.replace('.bam', '.tmp.bam')
+        cmd = f'samtools merge {tmp_pseudo_bam} {bam1} {bam2}'
         cmder.run(cmd, msg=f'Merging {bam1} and {bam2} ...')
+
+        cmder.run(f'samtools sort -@ {options.cores} -m 2G -o {pseudo_bam} {tmp_pseudo_bam}')
+        cmder.run(f'rm {tmp_pseudo_bam}')
+        cmder.run(f'samtools index {pseudo_bam}')
 
         bam1, bam2 = split_bam(pseudo_bam, f'{basename}.pseudo.01.bam', f'{basename}.pseudo.02.bam')
         return bam1, bam2
-    
+
     def count_lines(file):
         with open(file) as f:
             return sum(1 for line in f)
-    
-    pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds, keys, names = [], [], [], [], []
+
+    pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds = [], [], []
+    keys, names = [], []
     for sample1, sample2 in itertools.combinations(SAMPLES, 2):
         ip_bam1, ip_bam2 = sample1.ip_read.bam, sample2.ip_read.bam
         ip_basename = f'{ECLIP}/{sample1.key}.{sample2.key}'
@@ -744,18 +894,16 @@ def rescue_ratio(inputs, outputs):
         names.append(os.path.basename(ip_basename))
         pseudo_ip_bam = prepare_pseudo_bam(ip_bam1, ip_bam2, ip_basename)
         pseudo_ip_bams.extend(pseudo_ip_bam)
-        
-        pseudo_peak_beds.extend([call_peaks(bam) for bam in pseudo_ip_bam])
-            
+
+        pseudo_peak_beds.extend([clipper_peaks(bam) for bam in pseudo_ip_bam])
+
         input_bam1, input_bam2 = sample1.input_read.bam, sample2.input_read.bam
         input_basename = f'{ECLIP}/{sample1.key}.{sample2.key}'
         pseudo_input_bam = prepare_pseudo_bam(input_bam1, input_bam2, input_basename)
         pseudo_input_bams.extend(pseudo_input_bam)
 
-    cmd = ['peak.py'] + pseudo_ip_bams + pseudo_input_bams + pseudo_peak_beds
-    cmd += ['--cores', options.cores] + ['--species', options.species] + ['--outdir', options.outdir]
-    cmd.run(cmd)
-    
+    peak(pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds)
+
     count = count_lines(f'{ECLIP}/{".vs.".join(keys)}.reproducible.peaks.bed')
     pseudo_count = count_lines(f'{ECLIP}/{".vs.".join(names)}.reproducible.peaks.bed')
     ratio = max(count, pseudo_count) / min(count, pseudo_count)
@@ -763,29 +911,36 @@ def rescue_ratio(inputs, outputs):
         o.write(f'{ratio}')
 
 
-@task(inputs=[], outputs=f'{ECLIP}/self.consistency.ratio.txt')
-def consistency_ration(inputs, outputs):
+@task(inputs=[], outputs=f'{ECLIP}/consistency.ratio.txt', parent=clipper)
+def consistency_ratio(inputs, outputs):
     counts = []
     for (ip_read, input_read) in SAMPLES:
         names = [f'{ip_read.key}.split.{i:02d}' for i in range(2)]
         ip_bam1, ip_bam2 = [f'{ECLIP}/{name}.bam' for name in names]
         split_ip_bams = split_bam(ip_read.bam, ip_bam1, ip_bam2)
-        
-        split_peak_beds = [call_peaks(split_ip_bams[0]), call_peaks(split_ip_bams[1])]
-        
+
+        split_peak_beds = [clipper_peaks(split_ip_bams[0]), clipper_peaks(split_ip_bams[1])]
+
         input_bam1, input_bam2 = [f'{ECLIP}/{name}.bam' for name in names]
         split_input_bams = split_bam(input_read.bam, input_bam1, input_bam2)
 
-        cmd = ['peak.py'] + split_ip_bams + split_input_bams + split_peak_beds
-        cmd += ['--cores', options.cores] + ['--species', options.species] + ['--outdir', options.outdir]
-        cmd.run(cmd)
-        
+        peak(split_ip_bams, split_input_bams, split_peak_beds)
         counts.append(f'{ECLIP}/{".vs.".join(names)}.reproducible.peaks.bed')
-        
+
     ratio = counts[0] / counts[1]
     with open(outputs, 'w') as o:
         o.write(f'{ratio}')
-        
+
+
+# @task(inputs=[], outputs='summary.html', kind='create', parent=consistency_ratio, mkdir_before_run=['qc'])
+def summary():
+    def falco():
+        fastqs = [fastq for fastq in glob.iglob(f'{ECLIP}/*.fastq.gz') if 'trim' not in fastq]
+        cmd = ['falco', '--outdir', 'qc', '--skip-html'] + fastqs
+        cmder.run(cmd, msg='Check QC using falco ...', pmt=True)
+
+    falco()
+
 
 def schedule():
     sbatch = """#!/usr/bin/env bash
