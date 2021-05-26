@@ -57,9 +57,9 @@ sp.add_argument('--enrichment_filter', type=int, help="Pre-filter peaks that are
 js = parser.add_argument_group('Job Submit')
 js.add_argument('--job', type=str, help="Name of your job", default='eCLIP')
 js.add_argument('--email', type=str, help='Email address for notifying you the start, end, and abort of you job.')
-js.add_argument('--time', type=int, help='Time (in integer hours) for running your job.', default=24)
+js.add_argument('--time', type=int, help='Time (in integer hours) for running your job.', default=36)
 js.add_argument('--memory', type=int, help='Amount of memory (in GB) for all CPU cores.', default=32)
-js.add_argument('--cores', type=int, help='Maximum number of CPU cores can be used for your job.', default=8)
+js.add_argument('--cores', type=int, help='Maximum number of CPU cores can be used for your job.', default=16)
 js.add_argument('--scheduler', type=str, choices=('pbs', 'qsub', 'slurm', 'sbatch'),
                 help='Name (case insensitive) of the scheduler on your cluster.')
 js.add_argument('--hold_submit', action='store_true',
@@ -176,24 +176,30 @@ class Sample:
 
 def size(file, formatting=True):
     if os.path.isfile(file):
-        s = os.path.getsize(file)
+        size_bytes = os.path.getsize(file)
         if formatting:
-            if s < 1000:
-                s = f'[{s:.2f}B]'
-            elif s < 1000 * 1000:
-                s = f'[{s / 1000:.2f}KB]'
-            elif s < 1000 * 1000 * 1000:
-                s = f'[{s / 1000 / 1000:.2f}MB]'
-            else:
-                s = f'[{s / 1000 / 1000 / 1000:.2f}GB]'
+            if size_bytes == 0:
+                return '0B'
+            size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+            i = int(math.floor(math.log(size_bytes, 1024)))
+            size_bytes = size_bytes / math.pow(1024, i)
+            size_bytes = f'[{size_bytes:.2f}{size_name[i]}]'
+            # if s < 1024:
+            #     s = f'[{s:.2f}B]'
+            # elif s < 1024 * 1024:
+            #     s = f'[{s / 1024:.2f}KB]'
+            # elif s < 1024 * 1024 * 1024:
+            #     s = f'[{s / 1024 / 1024:.2f}MB]'
+            # else:
+            #     s = f'[{s / 1024 / 1024 / 1024:.2f}GB]'
     else:
-        s = '[?KB]' if formatting else 0
-    return s
+        size_bytes = '[?KB]' if formatting else 0
+    return size_bytes
 
 
 def parse_and_validate_samples():
     def estimate_max_processes():
-        max_size = max(sizes) / (1000 * 1000 * 1000) * 2
+        max_size = max(sizes) / (1024 * 1024 * 1024) * 2
         n = int(options.memory / max_size)
         if n == 0:
             n = 1
@@ -308,7 +314,7 @@ def umi_extract_or_barcode_demux_outputs():
     return list(outputs)
 
 
-@task(inputs=umi_extract_or_barcode_demux_outputs(), outputs=lambda i: i.replace('.r1.fastq.gz', '.trim.r1.fastq.gz'),
+@task(inputs=umi_extract_or_barcode_demux_outputs(), outputs=lambda i: i.replace('.r1.fastq.gz', '.trim.r1.fastq'),
       parent=prepare_reads)
 def cut_adapt(r1, fastq):
     def parse_adapters(flag, fasta):
@@ -333,9 +339,9 @@ def cut_adapt(r1, fastq):
             cmd = ['parse_barcodes.sh', options.randomer_length, options.barcodes_fasta] + read.barcodes
             folder = tempfile.mkdtemp(dir=ECLIP)
             cmder.run(cmd, msg='Parsing barcodes and finding adapters ...', cwd=folder)
-            adapters = parse_adapters('-a', os.path.join(folder, 'a_adapters.fasta'))
+            adapters = parse_adapters('-g', os.path.join(folder, 'g_adapters.fasta'))
             adapters += parse_adapters('-A', os.path.join(folder, 'A_adapters.fasta'))
-            adapters += parse_adapters('-g', os.path.join(folder, 'g_adapters.fasta'))
+            adapters += parse_adapters('-a', os.path.join(folder, 'a_adapters.fasta'))
             adapters1 = adapters
             adapters2 = parse_adapters('-A', os.path.join(folder, 'A_adapters.fasta'))
             overlap1 = parse_overlap(os.path.join(folder, 'trim_first_overlap_length.txt'))
@@ -346,27 +352,27 @@ def cut_adapt(r1, fastq):
     def get_ios(input1, input2, out1, out2):
         if '.umi.' in out1:
             tmp = out1.replace('.trim.', '.clean.')
-            ios1 = ['-o', tmp, input1, '>', out1.replace('.r1.trim.fastq', '.trim.first.metrics')]
+            ios1 = ['-o', tmp, input1, '>', input1.replace('.r1.fastq', '.trim.first.metrics')]
             msg1 = f"Cutting adapters for single read {input1} {size(input1)} (first round) ..."
 
-            ios2 = ['-o', out1, tmp, '>', out1.replace('.r1.clean.fastq', '.trim.second.metrics')]
+            ios2 = ['-o', out1, tmp, '>', input1.replace('.r1.fastq', '.trim.second.metrics')]
             msg2 = f"Cutting adapters for single read {tmp} {size(tmp)} (second round) ..."
         else:
-            tmp1, tmp2 = input1.replace('.trim.', '.clean.'), input2.replace('.trim.', '.clean.')
-            tmp_metrics = input1.replace('.r1.fastq.gz', '.trim.first.metrics')
-            ios1 = ['-o', out1, '-p', out2, tmp1, tmp2, '>', tmp_metrics]
+            tmp1, tmp2 = out1.replace('.trim.', '.clean.'), out2.replace('.trim.', '.clean.')
+            tmp_metrics = input1.replace('.r1.fastq', '.trim.first.metrics')
+            ios1 = ['-o', tmp1, '-p', tmp2, input1, input2, '>', tmp_metrics]
             msg1 = (f"Cutting adapters for paired reads {input1} {size(input1)} and\n{' ' * 45}"
                     f"{input2} {size(input2)} (first round) ...")
 
-            metrics = input1.replace('.r1.fastq.gz', '.trim.second.metrics')
+            metrics = input1.replace('.r1.fastq', '.trim.second.metrics')
             ios2 = ['-o', out1, '-p', out2, tmp1, tmp2, '>', metrics]
-            msg2 = (f"Cutting adapters for paired reads {tmp1} {size(tmp1)} and\n{' ' * 45}"
-                    f"{tmp2} {size(tmp2)} (second round) ...")
+            msg2 = (f"Cutting adapters for paired reads {tmp1} and\n{' ' * 45}"
+                    f"{tmp2} (second round) ...")
         return ios1, ios2, msg1, msg2
 
     def trim_adapters(adapters, overlap, ios, message):
-        cmd = ['cutadapt', '-O', overlap, '--times', '2', '-e', '0.0', '-j', options.cores, '-m', '18',
-               '--quality-cutoff', '6', '--match-read-wildcards'] + adapters + ios
+        cmd = ['cutadapt', '-O', overlap, '-j', options.cores, '--match-read-wildcards', '--times', 1,
+               '-e', 0.1, '--quality-cutoff', 6, '-m', 18] + adapters + ios
         cmder.run(cmd, msg=message, pmt=True)
 
     key = os.path.basename(r1).rsplit('.', maxsplit=4)[0]
@@ -382,7 +388,7 @@ def cut_adapt(r1, fastq):
 @task(inputs=cut_adapt, outputs=lambda i: i.replace('.trim.r1.', '.trim.sort.r1.'), processes=options.cores)
 def sort_fastq(fastq, output):
     tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=ECLIP)
-    cmd = f'zcat {fastq} | fastq-sort --id --temporary-directory {tmp} -S 2G | gzip > {output}'
+    cmd = f'zcat {fastq} | fastq-sort --id --temporary-directory {tmp} -S 2G > {output}'
     stdout, stderr = cmder.run(cmd, msg=f'Sorting {fastq} {size(fastq)} ...', fmt_cmd=False)
     print(stdout or stderr)
     cmder.run(f'rm -r {tmp}')
@@ -391,16 +397,16 @@ def sort_fastq(fastq, output):
     if os.path.isfile(fastq2):
         output2 = output.replace('.r1.', '.r2.')
         tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=ECLIP)
-        cmd = f'zcat {fastq2} | fastq-sort --id --temporary-directory {tmp} -S 2G | gzip >  {output2}'
+        cmd = f'zcat {fastq2} | fastq-sort --id --temporary-directory {tmp} -S 2G >  {output2}'
         cmder.run(cmd, msg=f'Sort fastq {fastq2} {size(fastq2)} ...', fmt_cmd=False)
         print(stdout or stderr)
         cmder.run(f'rm -r {tmp}')
     return output
 
 
-@task(inputs=[i.replace('.r1.', '.trim.sort.r1.') for i in umi_extract_or_barcode_demux_outputs()],
+@task(inputs=[i.replace('.r1.', '.trim.sort.r1.').replace('.gz', '') for i in umi_extract_or_barcode_demux_outputs()],
       parent=sort_fastq, mkdir_before_run=[f'{ECLIP}/repeat.elements.map'],
-      outputs=lambda i: (f'{ECLIP}/repeat.elements.map/{os.path.basename(i).replace(".trim.sort.r1.fastq.gz", "")}'
+      outputs=lambda i: (f'{ECLIP}/repeat.elements.map/{os.path.basename(i).replace(".trim.sort.r1.fastq", "")}'
                          f'/Unmapped.out.mate1'))
 def map_to_repeat_elements(fastq, mate1):
     fastq1, fastq2 = fastq, fastq.replace('.r1.', '.r2.')
@@ -426,7 +432,6 @@ def map_to_repeat_elements(fastq, mate1):
            '--outSAMtype', 'BAM', 'Unsorted',
            '--outSAMunmapped', 'Within',
            '--outStd', 'Log',
-           '--readFilesCommand', 'zcat',
            '--readFilesIn', fastq1]
     if os.path.exists(fastq2):
         cmd.append(fastq2)
@@ -537,7 +542,7 @@ def prepare_bam(bam, out):
         name_sort_bam(bam, out)
 
 
-@task(inputs=prepare_bam, outputs=lambda i: i.replace('.sort.bam', '.sort.dedup.bam'))
+@task(inputs=prepare_bam, outputs=lambda i: i.replace('.sort.bam', '.sort.dedup.bam'), processes=PROCESSES)
 def dedup_bam(bam, out):
     """Collapse barcodes of paired-end bam or umi_tools dedup single-end bam."""
     if TYPE == 'single':
@@ -664,13 +669,12 @@ container multiWig
     track = options.track.replace(' ', '_')
     with open(output, 'w') as o:
         o.write(header)
-        for bw in inputs:
-            plus = os.path.basename(bw)
+        for key in READS:
+            plus = f'{key}.plus.bw'
             name1 = plus.replace('.bw', '').replace('.', '_')
             name2 = name1.replace('plus', 'minus')
-            basename = plus.replace('.plus.bw', '')
-            minus = plus.replace('.plus.bw', '.minus.bw')
-            o.write(block.format(track=track, name1=name1, name2=name2, basename=basename, plus=plus, minus=minus))
+            minus = f'{key}.minus.bw'
+            o.write(block.format(track=track, name1=name1, name2=name2, basename=key, plus=plus, minus=minus))
     run_time = int(time.perf_counter() - start_time)
     message = message.replace(' ...', f' completed in [{str(datetime.timedelta(seconds=run_time))}].')
     logger.info(message)
@@ -760,7 +764,7 @@ def peak(ip_bams, input_bams, peak_beds):
         if os.path.isfile(compressed_bed):
             logger.info(f'Compressed peaks {compressed_bed} already exist.')
         else:
-            cmd = ['compress_peak.pl', normalized_bed, compressed_bed]
+            cmd = ['compress_peak.pl', normalized_bed.replace('.bed', '.full.bed'), compressed_bed]
             cmder.run(cmd, msg=f'Compressing peaks in {normalized_bed} ...', pmt=True)
 
         annotated_bed = compressed_bed.replace('.compressed.bed', '.compressed.annotated.full.bed')
@@ -768,7 +772,7 @@ def peak(ip_bams, input_bams, peak_beds):
             logger.info(f'Annotated peaks {annotated_bed} already exist.')
         else:
             species = 'hg19' if options.species == 'hg19chr19' else options.species
-            cmd = ['annotate_peak.pl', compressed_bed, annotated_bed, species, 'full']
+            cmd = ['annotate_peak.pl', compressed_bed.replace('.bed', '.full.bed'), annotated_bed, species, 'full']
             cmder.run(cmd, msg=f'Annotating peaks in {compressed_bed} ...', pmt=True)
 
         entropy_bed = annotated_bed.replace('.annotated.full.bed', '.annotated.entropy.bed')
@@ -777,7 +781,7 @@ def peak(ip_bams, input_bams, peak_beds):
             logger.info(f'Entropy bed {annotated_bed} already exist.')
         else:
             calculate_entropy(annotated_bed, entropy_bed, ip_read_count, input_read_count)
-        entropy_beds[name] = entropy_bed.replace('.bed', '.full.bed')
+        entropy_beds[name] = entropy_bed
 
     for key1, key2 in itertools.combinations(entropy_beds.keys(), 2):
         idr_out, idr_bed = f'{ECLIP}/{key1}.vs.{key2}.idr.out', f'{ECLIP}/{key1}.vs.{key2}.idr.out.bed'
@@ -835,7 +839,7 @@ def peak(ip_bams, input_bams, peak_beds):
         cmder.run(cmd, msg='Identifying reproducible peaks ...', pmt=True)
 
 
-# @task(inputs=[], outputs=f'{".vs.".join([s.key for s in SAMPLES])}.reproducible.peaks.bed', parent=clipper)
+@task(inputs=[], outputs=f'{".vs.".join([s.key for s in SAMPLES])}.reproducible.peaks.bed', parent=clipper)
 def reproducible_peaks(inputs, outputs):
     ip_bams, input_bams, peak_beds = [], [], []
     for sample in SAMPLES:
