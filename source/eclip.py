@@ -18,6 +18,7 @@ import tempfile
 import shutil
 import itertools
 import math
+
 import pysam
 import cmder
 import pandas as pd
@@ -247,11 +248,6 @@ HEADER = fr"""
                                VERSION {VERSION}
 """
 
-fastqs, links = [], []
-for read in READS.values():
-    fastqs.append(read.fastq1)
-    links.append(read.link1)
-
 
 @task(inputs=[read.fastq1 for read in READS.values()], outputs=[read.link1 for read in READS.values()],
       mkdir_before_run=['eclip'])
@@ -389,18 +385,20 @@ def cut_adapt(r1, fastq):
 def sort_fastq(fastq, output):
     tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=ECLIP)
     cmd = f'zcat {fastq} | fastq-sort --id --temporary-directory {tmp} -S 2G > {output}'
-    stdout, stderr = cmder.run(cmd, msg=f'Sorting {fastq} {size(fastq)} ...', fmt_cmd=False)
-    print(stdout or stderr)
-    cmder.run(f'rm -r {tmp}')
+    try:
+        cmder.run(cmd, msg=f'Sorting {fastq} {size(fastq)} ...', fmt_cmd=False)
+    finally:
+        shutil.rmtree(tmp)
 
     fastq2 = fastq.replace('.r1.', '.r2.')
     if os.path.isfile(fastq2):
         output2 = output.replace('.r1.', '.r2.')
         tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=ECLIP)
         cmd = f'zcat {fastq2} | fastq-sort --id --temporary-directory {tmp} -S 2G >  {output2}'
-        cmder.run(cmd, msg=f'Sort fastq {fastq2} {size(fastq2)} ...', fmt_cmd=False)
-        print(stdout or stderr)
-        cmder.run(f'rm -r {tmp}')
+        try:
+            cmder.run(cmd, msg=f'Sort fastq {fastq2} {size(fastq2)} ...', fmt_cmd=False)
+        finally:
+            shutil.rmtree(tmp)
     return output
 
 
@@ -711,8 +709,9 @@ def pureclip(bam, bed):
 
 
 def mapped_read_count(bam):
-    with pysam.AlignmentFile(bam, 'rb') as sam:
-        return sam.mapped
+    return int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='')[0])
+    # with pysam.AlignmentFile(bam, 'rb') as sam:
+    #     return sam.mapped
 
 
 def calculate_entropy(bed, output, ip_read_count, input_read_count):
@@ -870,6 +869,12 @@ def split_bam(bam, bam1, bam2):
     return bam1, bam2
 
 
+def count_lines(file):
+    return int(cmder.run(f'wc -l {file}')[0])
+    # with open(file) as f:
+    #     return sum(1 for line in f)
+
+
 @task(inputs=[], outputs=f'{ECLIP}/rescue.ratio.txt', parent=clipper)
 def rescue_ratio(inputs, outputs):
     def prepare_pseudo_bam(bam1, bam2, basename):
@@ -885,15 +890,11 @@ def rescue_ratio(inputs, outputs):
         bam1, bam2 = split_bam(pseudo_bam, f'{basename}.pseudo.01.bam', f'{basename}.pseudo.02.bam')
         return bam1, bam2
 
-    def count_lines(file):
-        with open(file) as f:
-            return sum(1 for line in f)
-
     pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds = [], [], []
     keys, names = [], []
     for sample1, sample2 in itertools.combinations(SAMPLES, 2):
         ip_bam1, ip_bam2 = sample1.ip_read.bam, sample2.ip_read.bam
-        ip_basename = f'{ECLIP}/{sample1.key}.{sample2.key}'
+        ip_basename = f'{ECLIP}/{sample1.key}.{sample2.key}.ip'
         keys.append(sample1.key)
         names.append(os.path.basename(ip_basename))
         pseudo_ip_bam = prepare_pseudo_bam(ip_bam1, ip_bam2, ip_basename)
@@ -902,7 +903,7 @@ def rescue_ratio(inputs, outputs):
         pseudo_peak_beds.extend([clipper_peaks(bam) for bam in pseudo_ip_bam])
 
         input_bam1, input_bam2 = sample1.input_read.bam, sample2.input_read.bam
-        input_basename = f'{ECLIP}/{sample1.key}.{sample2.key}'
+        input_basename = f'{ECLIP}/{sample1.key}.{sample2.key}.input'
         pseudo_input_bam = prepare_pseudo_bam(input_bam1, input_bam2, input_basename)
         pseudo_input_bams.extend(pseudo_input_bam)
 
@@ -920,30 +921,153 @@ def consistency_ratio(inputs, outputs):
     counts = []
     for (ip_read, input_read) in SAMPLES:
         names = [f'{ip_read.key}.split.{i:02d}' for i in range(2)]
-        ip_bam1, ip_bam2 = [f'{ECLIP}/{name}.bam' for name in names]
+        ip_bam1, ip_bam2 = [f'{ECLIP}/{name}.ip.bam' for name in names]
         split_ip_bams = split_bam(ip_read.bam, ip_bam1, ip_bam2)
 
         split_peak_beds = [clipper_peaks(split_ip_bams[0]), clipper_peaks(split_ip_bams[1])]
 
-        input_bam1, input_bam2 = [f'{ECLIP}/{name}.bam' for name in names]
+        input_bam1, input_bam2 = [f'{ECLIP}/{name}.input.bam' for name in names]
         split_input_bams = split_bam(input_read.bam, input_bam1, input_bam2)
 
         peak(split_ip_bams, split_input_bams, split_peak_beds)
-        counts.append(f'{ECLIP}/{".vs.".join(names)}.reproducible.peaks.bed')
+        counts.append(count_lines(f'{ECLIP}/{".vs.".join(names)}.reproducible.peaks.bed'))
 
     ratio = counts[0] / counts[1]
     with open(outputs, 'w') as o:
         o.write(f'{ratio}')
 
 
+def prepare_fastqs():
+    fastqs = []
+    for key, read in READS.items():
+        fastq1, fastq2 = read.link1, read.link2
+        fastqs.append(fastq1)
+        if fastq2:
+            fastqs.append(fastq2)
+            barcodes = read.barcodes
+            for barcode in barcodes:
+                fastqs.extend([f'{ECLIP}/{key}.{barcode}.r1.fastq.gz', f'{ECLIP}/{key}.{barcode}.r2.fastq.gz'])
+    return fastqs
+
+
+@task(inputs=prepare_fastqs(), outputs=lambda i: i.replace(f'{ECLIP}/', f'{QC}/').replace('.fastq.gz', '.fastq.qc.txt'),
+      parent=consistency_ratio, mkdir_before_run=['qc'])
+def falco(fastq, txt):
+    tmp = tempfile.mkdtemp(suffix='_qc', prefix='falco_', dir=QC)
+    cmd = f'falco --outdir {tmp} --skip-html {fastq}'
+    try:
+        cmder.run(cmd, msg=f'Checking reads in {fastq} {size(fastq)} using falco ...', fmt_cmd=False)
+        cmder.run(f'mv {tmp}/fastqc_data.txt {txt}')
+    finally:
+        shutil.rmtree(tmp)
+
+
 # @task(inputs=[], outputs='summary.html', kind='create', parent=consistency_ratio, mkdir_before_run=['qc'])
 def summary():
-    def falco():
-        fastqs = [fastq for fastq in glob.iglob(f'{ECLIP}/*.fastq.gz') if 'trim' not in fastq]
-        cmd = ['falco', '--outdir', 'qc', '--skip-html'] + fastqs
-        cmder.run(cmd, msg='Check QC using falco ...', pmt=True)
+    pass
 
-    falco()
+    def parse_falco_metrics(txt):
+        sample, reads, duplicate = '', 0, 0.0
+        with open(txt) as f:
+            for line in f:
+                if line.startswith('Filename'):
+                    sample = line.strip().split('\t')[1].replace('.fastq.gz', '')
+                elif line.startswith('Total Sequences'):
+                    reads = int(line.strip().split('\t')[1])
+                elif line.startswith('#Total Deduplicated Percentage'):
+                    duplicate = float(line.strip().split('\t')[1])
+                    break
+        return sample, reads, duplicate
+
+    def parse_cutadapt_metrics(metrics):
+        sample, reads, reads_too_short = os.path.basename(metrics).split('.trim.')[0], 0, 0
+        with open(metrics) as f:
+            for line in f:
+                if ('Reads written (passing filters)' in line) or ('Pairs written (passing filters)' in line):
+                    reads = int(line.strip().split()[-2].replace(',', ''))
+                elif ('Reads that were too short' in line) or ('Pairs that were too short' in line):
+                    reads_too_short = int(line.strip().split()[-2].replace(',', ''))
+        return sample, reads, reads_too_short
+
+    def parse_star_log(log):
+        columns = ['Uniquely mapped', 'Mapped to multiple loci', 'Mapped to too many loci',
+                   'Unmapped: too many mismatches', 'Unmapped: too short', 'Unmapped: other']
+        counts, reads = [os.path.basename(os.path.dirname(log))], 0
+        with open(log) as f:
+            for line in f:
+                if 'Number of input reads' in line:
+                    reads = int(line.strip().split('\t')[-1])
+                if 'Uniquely mapped reads number' in line:
+                    counts.append(int(line.strip().split('\t')[-1]))
+                if 'Number of reads mapped to multiple loci' in line:
+                    counts.append(int(line.strip().split('\t')[-1]))
+                if 'Number of reads mapped to too many loci' in line:
+                    counts.append(int(line.strip().split('\t')[-1]))
+                if '% of reads unmapped: too many mismatches' in line:
+                    counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
+                if '% of reads unmapped: too short' in line:
+                    counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
+                if '% of reads unmapped: other' in line:
+                    counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
+        return counts
+
+    def get_dedup_metrics(bam1, bam2):
+        sample = os.path.basename(bam1).replace('.sort.bam', '')
+        n, _ = cmder.run(f'samtools view -c -F 0x4 {bam1}', msg='')
+        n2, _ = cmder.run(f'samtools view -c -F 0x4 {bam2}', msg='')
+        return sample, int(n) - int(n2), int(n2)
+
+    def get_usable_reads(bam):
+        sample = os.path.basename(bam1).replace('.bam', '')
+        return sample, int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='')[0])
+
+    raw_reads, demux_reads, cut1, cut2 = [], [], [], []
+    repeat_map, genome_map, dedup_reads, usable_reads = [], [], [], []
+    for key, read in READS.items():
+        raw_reads.append(parse_falco_metrics(f'{QC}/{key}.r1.fastq.qc.txt'))
+        barcodes = read.barcodes if read.link2 else ['umi']
+        if read.link2:
+            raw_reads.append(parse_falco_metrics(f'{QC}/{key}.r2.fastq.qc.txt'))
+            for barcode in set(read.barcodes):
+                demux_reads.append(parse_falco_metrics(f'{QC}/{key}.{barcode}.r1.fastq.qc.txt'))
+                demux_reads.append(parse_falco_metrics(f'{QC}/{key}.{barcode}.r2.fastq.qc.txt'))
+
+        for barcode in set(barcodes):
+            cut1_metrics = f'{ECLIP}/{key}.{barcode}.trim.first.metrics'
+            cut1.append(parse_cutadapt_metrics(cut1_metrics))
+            # shutil.move(cut1_metrics, cut1_metrics.replace(f'{ECLIP}/', f'{QC}/'))
+
+            cut2_metrics = f'{ECLIP}/{key}.{barcode}.trim.second.metrics'
+            cut2.append(parse_cutadapt_metrics(cut2_metrics))
+            # shutil.move(cut2_metrics, cut2_metrics.replace(f'{ECLIP}/', f'{QC}/'))
+
+            repeat_map_log = f'{ECLIP}/repeat.elements.map/{key}.{barcode}/Log.final.out'
+            repeat_map.append(parse_star_log(repeat_map_log))
+            # shutil.move(repeat_map_log, f'{QC}/{key}.{barcode}.repeat.element.map.log')
+
+            genome_map_log = f'{ECLIP}/reference.genome.map/{key}.{barcode}/Log.final.out'
+            genome_map.append(parse_star_log(genome_map_log))
+            # shutil.move(genome_map_log, f'{QC}/{key}.{barcode}.reference.genome.map.log')
+
+            bam1, bam2 = f'{ECLIP}/{key}.{barcode}.sort.bam', f'{ECLIP}/{key}.{barcode}.sort.dedup.sort.bam'
+            dedup_reads.append(get_dedup_metrics(bam1, bam2))
+
+            usable_reads.append([f'{key}.{barcode}', get_usable_reads(f'{ECLIP}/{key}.{barcode}.bam')])
+
+    counts = {'raw_reads': raw_reads, 'demux_reads': demux_reads, 'cut1': cut1, 'cut2': cut2,
+              'repeat_map': repeat_map, 'genome_map': genome_map,
+              'dedup_reads': dedup_reads, 'usable_reads': usable_reads}
+    with open(f'{QC}/summary.json', 'w') as o:
+        json.dump(counts, o, indent=True)
+    print(raw_reads)
+    print(demux_reads)
+    print(cut1)
+    print(cut2)
+    print(repeat_map)
+    print(genome_map)
+    print(dedup_reads)
+    print(usable_reads)
+
 
 
 def schedule():
@@ -1056,3 +1180,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+    # for fastq in prepare_fastqs():
+    #     falco(fastq, fastq.replace(f'{ECLIP}/', f'{QC}/').replace('.fastq.gz', '.fastq.qc.txt'))
+    # summary()
