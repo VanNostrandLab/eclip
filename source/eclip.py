@@ -950,8 +950,8 @@ def prepare_fastqs():
     return fastqs
 
 
-# @task(inputs=prepare_fastqs(), outputs=lambda i: i.replace(f'{ECLIP}/', f'{QC}/').replace('.fastq.gz', '.fastq.qc.txt'),
-#       parent=consistency_ratio, mkdir_before_run=['qc'])
+@task(inputs=prepare_fastqs(), outputs=lambda i: i.replace(f'{ECLIP}/', f'{QC}/').replace('.fastq.gz', '.fastq.qc.txt'),
+      parent=consistency_ratio, mkdir_before_run=['qc'], processes=options.cores)
 def falco(fastq, txt):
     tmp = tempfile.mkdtemp(suffix='_qc', prefix='falco_', dir=QC)
     cmd = f'falco --outdir {tmp} --skip-html {fastq}'
@@ -962,7 +962,7 @@ def falco(fastq, txt):
         shutil.rmtree(tmp)
 
 
-# @task(inputs=[], outputs='summary.html', kind='create', parent=consistency_ratio, mkdir_before_run=['qc'])
+# @task(inputs=[], outputs='summary.html', kind='create', parent=consistency_ratio)
 def summary():
     pass
 
@@ -1067,7 +1067,6 @@ def summary():
     print(genome_map)
     print(dedup_reads)
     print(usable_reads)
-
 
 
 def schedule():
