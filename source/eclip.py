@@ -962,10 +962,8 @@ def falco(fastq, txt):
         shutil.rmtree(tmp)
 
 
-# @task(inputs=[], outputs='summary.html', kind='create', parent=consistency_ratio)
-def summary():
-    pass
-
+@task(inputs=[], outputs='summary.html', kind='create', parent=falco)
+def summary(inputs, outputs):
     def parse_falco_metrics(txt):
         sample, reads, duplicate = '', 0, 0.0
         with open(txt) as f:
@@ -1052,21 +1050,13 @@ def summary():
             bam1, bam2 = f'{ECLIP}/{key}.{barcode}.sort.bam', f'{ECLIP}/{key}.{barcode}.sort.dedup.sort.bam'
             dedup_reads.append(get_dedup_metrics(bam1, bam2))
 
-            usable_reads.append([f'{key}.{barcode}', get_usable_reads(f'{ECLIP}/{key}.{barcode}.bam')])
+            usable_reads.append([f'{key}.{barcode}', get_usable_reads(f'{ECLIP}/{key}.bam')])
 
     counts = {'raw_reads': raw_reads, 'demux_reads': demux_reads, 'cut1': cut1, 'cut2': cut2,
               'repeat_map': repeat_map, 'genome_map': genome_map,
               'dedup_reads': dedup_reads, 'usable_reads': usable_reads}
     with open(f'{QC}/summary.json', 'w') as o:
-        json.dump(counts, o, indent=True)
-    print(raw_reads)
-    print(demux_reads)
-    print(cut1)
-    print(cut2)
-    print(repeat_map)
-    print(genome_map)
-    print(dedup_reads)
-    print(usable_reads)
+        json.dump(counts, o, indent=4)
 
 
 def schedule():
