@@ -498,12 +498,12 @@ def map_to_reference_genome(mate1, bam):
 
 
 def name_sort_bam(bam, out):
-    cmder.run(f'samtools sort -n -@ {options.cores} -m {min(4, int(options.memory / PROCESSES))}G -o {out} {bam}',
+    cmder.run(f'samtools sort -n -@ {options.cores} -m 2G -o {out} {bam}',
               msg=f'Name sorting {bam} {size(bam)} ...')
 
 
 def position_sort_bam(bam, out):
-    cmder.run(f'samtools sort -@ {options.cores} -m {min(4, int(options.memory / PROCESSES))}G -o {out} {bam}',
+    cmder.run(f'samtools sort -@ {options.cores} -m 2G -o {out} {bam}',
               msg=f'Sorting {bam} {size(bam)} ...')
 
 
@@ -540,7 +540,7 @@ def prepare_bam(bam, out):
         name_sort_bam(bam, out)
 
 
-@task(inputs=prepare_bam, outputs=lambda i: i.replace('.sort.bam', '.sort.dedup.bam'), processes=PROCESSES)
+@task(inputs=prepare_bam, outputs=lambda i: i.replace('.sort.bam', '.sort.dedup.bam'), processes=options.cores)
 def dedup_bam(bam, out):
     """Collapse barcodes of paired-end bam or umi_tools dedup single-end bam."""
     if TYPE == 'single':
@@ -1156,7 +1156,7 @@ def main():
     else:
         keys = ('MANIFEST', 'outdir', 'genome', 'repeat', 'processes')
         d = vars(options).copy()
-        d['processes'] = f'{PROCESSES} / {options.cores}'
+        d['processes'] = options.cores
         setting = '\n'.join([f'{k.title():>22}: {v}' for k, v in d.items() if k in keys])
         logger.debug(HEADER)
         logger.trace(f'\nRunning eclip using the following settings:\n\n{setting}\n')
