@@ -355,12 +355,12 @@ def cut_adapt(r1, fastq):
             msg2 = f"Cutting adapters for single read {tmp} {size(tmp)} (second round) ..."
         else:
             tmp1, tmp2 = out1.replace('.trim.', '.clean.'), out2.replace('.trim.', '.clean.')
-            tmp_metrics = input1.replace('.r1.fastq', '.trim.first.metrics')
+            tmp_metrics = input1.replace('.r1.fastq.gz', '.trim.first.metrics')
             ios1 = ['-o', tmp1, '-p', tmp2, input1, input2, '>', tmp_metrics]
             msg1 = (f"Cutting adapters for paired reads {input1} {size(input1)} and\n{' ' * 45}"
                     f"{input2} {size(input2)} (first round) ...")
 
-            metrics = input1.replace('.r1.fastq', '.trim.second.metrics')
+            metrics = input1.replace('.r1.fastq.gz', '.trim.second.metrics')
             ios2 = ['-o', out1, '-p', out2, tmp1, tmp2, '>', metrics]
             msg2 = (f"Cutting adapters for paired reads {tmp1} and\n{' ' * 45}"
                     f"{tmp2} (second round) ...")
@@ -384,9 +384,9 @@ def cut_adapt(r1, fastq):
 @task(inputs=cut_adapt, outputs=lambda i: i.replace('.trim.r1.', '.trim.sort.r1.'), processes=options.cores)
 def sort_fastq(fastq, output):
     tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=ECLIP)
-    cmd = f'zcat {fastq} | fastq-sort --id --temporary-directory {tmp} -S 2G > {output}'
+    cmd = f'fastq-sort --id --temporary-directory {tmp} -S 2G {fastq} > {output}'
     try:
-        cmder.run(cmd, msg=f'Sorting {fastq} {size(fastq)} ...', fmt_cmd=False)
+        cmder.run(cmd, msg=f'Sorting {fastq} {size(fastq)} ...', fmt_cmd=False, pmt=True)
     finally:
         shutil.rmtree(tmp)
 
@@ -394,7 +394,7 @@ def sort_fastq(fastq, output):
     if os.path.isfile(fastq2):
         output2 = output.replace('.r1.', '.r2.')
         tmp = tempfile.mkdtemp(suffix='_sort', prefix='fastq_', dir=ECLIP)
-        cmd = f'zcat {fastq2} | fastq-sort --id --temporary-directory {tmp} -S 2G >  {output2}'
+        cmd = f'fastq-sort --id --temporary-directory {tmp} -S 2G {fastq2} >  {output2}'
         try:
             cmder.run(cmd, msg=f'Sort fastq {fastq2} {size(fastq2)} ...', fmt_cmd=False)
         finally:
@@ -680,13 +680,11 @@ container multiWig
 
 def clipper_peaks(bam, bed=''):
     bed = bed if bed else bam.replace('.bam', '.peak.clusters.bed')
-    print('before', bed, os.path.isfile(bed))
     if os.path.isfile(bed):
         logger.info(f'Clipper bed {bed} already exists.')
     else:
         cmd = f'clipper --species {options.species} --processors {options.cores} --bam {bam} --outfile {bed}'
         cmder.run(cmd, msg=f'Calling peaks from {bam} {size(bam)} using clipper ...', pmt=True)
-    print('after', bed, os.path.isfile(bed))
     return bed
 
 
@@ -708,17 +706,14 @@ def pureclip(bam, bed):
     cmder.run(cmd, msg=f'Calling peaks from {bam} {size(bam)} using pureCLIP ...', pmt=True)
 
 
-def mapped_read_count(bam):
-    return int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='')[0])
-    # with pysam.AlignmentFile(bam, 'rb') as sam:
-    #     return sam.mapped
+def count_mapped_reads(bam):
+    count = int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='')[0])
+    logger.info(f'Found {count:,} mapped reads in {bam}.')
+    return count
 
 
 def calculate_entropy(bed, output, ip_read_count, input_read_count):
     logger.info(f'Calculating entropy for {bed} ...')
-    # name = bed.replace('.peak.clusters.normalized.compressed.annotated.full.bed', '')
-    # ip_bam, input_bam, peak_bed = data[name]
-    # ip_mapped_read_count, input_mapped_read_count = mapped_read_count(ip_bam), mapped_read_count(input_bam)
     columns = ['chrom', 'start', 'end', 'peak', 'ip_read_number', 'input_read_number',
                'p', 'v', 'method', 'status', 'l10p', 'l2fc',
                'ensg_overlap', 'feature_type', 'feature_ensg', 'gene', 'region']
@@ -746,13 +741,13 @@ def calculate_entropy(bed, output, ip_read_count, input_read_count):
     return output
 
 
-def peak(ip_bams, input_bams, peak_beds):
-    entropy_beds = {}
+def peak(ip_bams, input_bams, peak_beds, reproducible_bed):
+    entropy_beds, folder = {}, os.path.dirname(reproducible_bed)
     for ip_bam, input_bam, peak_bed in zip(ip_bams, input_bams, peak_beds):
         logger.info(f'Processing {peak_bed} ...')
         name = os.path.basename(peak_bed.replace('.peak.clusters.bed', ''))
         normalized_bed = peak_bed.replace('.peak.clusters.bed', '.peak.clusters.normalized.bed')
-        ip_read_count, input_read_count = mapped_read_count(ip_bam), mapped_read_count(input_bam)
+        ip_read_count, input_read_count = count_mapped_reads(ip_bam), count_mapped_reads(input_bam)
         if os.path.isfile(normalized_bed):
             logger.info(f'Normalized peaks {normalized_bed} already exist.')
         else:
@@ -783,7 +778,7 @@ def peak(ip_bams, input_bams, peak_beds):
         entropy_beds[name] = entropy_bed
 
     for key1, key2 in itertools.combinations(entropy_beds.keys(), 2):
-        idr_out, idr_bed = f'{ECLIP}/{key1}.vs.{key2}.idr.out', f'{ECLIP}/{key1}.vs.{key2}.idr.out.bed'
+        idr_out, idr_bed = f'{folder}/{key1}.vs.{key2}.idr.out', f'{folder}/{key1}.vs.{key2}.idr.out.bed'
         entropy_bed1, entropy_bed2 = entropy_beds[key1], entropy_beds[key2]
         if os.path.isfile(idr_out):
             logger.info(f'IDR out {idr_out} already exist.')
@@ -799,7 +794,7 @@ def peak(ip_bams, input_bams, peak_beds):
                    entropy_bed1.replace('.bed', '.full.bed'), entropy_bed2.replace('.bed', '.full.bed'), idr_bed]
             cmder.run(cmd, msg=f'Parsing IDR peaks in {idr_out} ...', pmt=True)
 
-    idr_bed = f'{ECLIP}/{".vs.".join(entropy_beds.keys())}.idr.out.bed'
+    idr_bed = f'{folder}/{".vs.".join(entropy_beds.keys())}.idr.out.bed'
     if len(entropy_beds) == 2:
         script = 'reproducible_peaks.pl'
     elif len(entropy_beds) == 3:
@@ -807,13 +802,12 @@ def peak(ip_bams, input_bams, peak_beds):
         if os.path.isfile(idr_bed):
             logger.info(f'IDR bed {idr_bed} already exist.')
         else:
-            bed1, bed2, bed3 = [f'{ECLIP}/{key1}.vs.{key2}.idr.out.bed'
+            bed1, bed2, bed3 = [f'{folder}/{key1}.vs.{key2}.idr.out.bed'
                                 for key1, key2 in itertools.combinations(entropy_beds.keys(), 2)]
             cmder.run(f'bedtools intersect -a {bed1} -b {bed2} {bed3} > {idr_bed}', msg='Intersecting IDR beds ...')
     else:
-        raise ValueError('Method for handeling more than 3 replicates has not been implemented yet.')
+        raise ValueError('Method for handling more than 3 replicates has not been implemented yet.')
 
-    reproducible_bed = f'{ECLIP}/{".vs.".join(entropy_beds.keys())}.reproducible.peaks.bed'
     if os.path.isfile(reproducible_bed):
         logger.info(f'Reproducible peaks {reproducible_bed} already exist.')
     else:
@@ -821,61 +815,61 @@ def peak(ip_bams, input_bams, peak_beds):
         idr_normalized_full_beds, entropy_full_beds, reproducible_full_beds = [], [], []
         for ip_bam, input_bam, peak_bed in zip(ip_bams, input_bams, peak_beds):
             name = os.path.basename(peak_bed.replace('.peak.clusters.bed', ''))
-            idr_normalized_bed = f'{ECLIP}/{name}.idr.normalized.bed'
+            idr_normalized_bed = f'{folder}/{name}.idr.normalized.bed'
             if os.path.isfile(idr_normalized_bed):
                 logger.info(f'IDR normalized bed {idr_normalized_bed} already exist.')
             else:
                 cmd = ['overlap_peak.pl', ip_bam, input_bam, idr_bed,
-                       mapped_read_count(ip_bam), mapped_read_count(input_bam), idr_normalized_bed]
+                       count_mapped_reads(ip_bam), count_mapped_reads(input_bam), idr_normalized_bed]
                 cmder.run(cmd, msg=f'Normalizing IDR peaks for sample {name} ...', pmt=True)
             idr_normalized_full_beds.append(idr_normalized_bed.replace('.bed', '.full.bed'))
-            entropy_full_beds.append(f'{ECLIP}/{name}.peak.clusters.normalized.compressed.annotated.entropy.full.bed')
-            reproducible_full_beds.append(f'{ECLIP}/{name}.reproducible.peaks.full.bed')
-
+            entropy_full_beds.append(f'{folder}/{name}.peak.clusters.normalized.compressed.annotated.entropy.full.bed')
+            reproducible_full_beds.append(f'{folder}/{name}.reproducible.peaks.full.bed')
+    
         cmd = [script, ] + idr_normalized_full_beds + reproducible_full_beds
         cmd += [reproducible_bed, custom_bed] + entropy_full_beds
-        cmd += [reproducible_bed.replace('.reproducible.peaks.bed', '.idr.out')]
+        cmd += [f'{folder}/{".vs.".join(entropy_beds.keys())}.idr.out']
         cmder.run(cmd, msg='Identifying reproducible peaks ...', pmt=True)
+    return reproducible_bed
 
 
-@task(inputs=[], outputs=f'{".vs.".join([s.key for s in SAMPLES])}.reproducible.peaks.bed', parent=clipper)
+@task(inputs=[], outputs=f'{ECLIP}/{".vs.".join([s.key for s in SAMPLES])}.reproducible.peaks.bed', parent=clipper)
 def reproducible_peaks(inputs, outputs):
     ip_bams, input_bams, peak_beds = [], [], []
     for sample in SAMPLES:
         ip_bams.append(sample.ip_read.bam)
         input_bams.append(sample.input_read.bam)
         peak_beds.append(sample.bed)
-    peak(ip_bams, input_bams, peak_beds)
+    peak(ip_bams, input_bams, peak_beds,  outputs)
 
 
 def split_bam(bam, bam1, bam2):
     if os.path.isfile(bam1) and os.path.isfile(bam2):
         logger.info(f'BAMs {bam1} and {bam2} already exist.')
     else:
-        with pysam.AlignmentFile(bam, 'rb') as sam:
-            half_lines = int(sam.mapped / 2)
+        half_lines = int(count_mapped_reads(bam) / 2) + 1
         cmd = f'samtools view {bam} | shuf | split -d -l {half_lines} - {bam}'
         cmder.run(cmd, msg=f'Shuffling and splitting {bam} ...')
         tmp_bam1, tmp_bam2 = bam1.replace('.bam', '.tmp.bam'), bam2.replace('.bam', '.tmp.bam')
         cmd = f'samtools view -H {bam} | cat - {bam}00 | samtools view -bS - > {tmp_bam1}'
+        
         cmder.run(cmd, msg=f'Creating headers for {bam1} ...')
         cmder.run(f'samtools sort -@ {options.cores} -m 2G -o {bam1} {tmp_bam1}')
-        cmder.run(f'samtools index {bam1}')
-        cmd = f'samtools view -H {bam} | cat - {bam}00 | samtools view -bS - > {tmp_bam2}'
+        cmd = f'samtools view -H {bam} | cat - {bam}01 | samtools view -bS - > {tmp_bam2}'
+        
         cmder.run(cmd, msg=f'Creating headers for {bam2} ...')
         cmder.run(f'samtools sort -@ {options.cores} -m 2G -o {bam2} {tmp_bam2}')
-        cmder.run(f'samtools index {bam2}')
-        cmder.run(f'rm {tmp_bam1} {tmp_bam2}')
+        cmder.run(f'rm {bam}00 {bam}01 {tmp_bam1} {tmp_bam2}')
     return bam1, bam2
 
 
 def count_lines(file):
-    return int(cmder.run(f'wc -l {file}')[0])
-    # with open(file) as f:
-    #     return sum(1 for line in f)
+    lines = int(cmder.run(f'wc -l {file}')[0].split()[0])
+    logger.info(f'Found {lines:,} lines in {file}.')
+    return lines
 
 
-@task(inputs=[], outputs=f'{ECLIP}/rescue.ratio.txt', parent=clipper)
+@task(inputs=[], outputs=f'{ECLIP}/rescue.ratio.txt', parent=clipper, mkdir_before_run=['rescue'])
 def rescue_ratio(inputs, outputs):
     def prepare_pseudo_bam(bam1, bam2, basename):
         pseudo_bam = f'{basename}.bam'
@@ -885,56 +879,62 @@ def rescue_ratio(inputs, outputs):
 
         cmder.run(f'samtools sort -@ {options.cores} -m 2G -o {pseudo_bam} {tmp_pseudo_bam}')
         cmder.run(f'rm {tmp_pseudo_bam}')
-        cmder.run(f'samtools index {pseudo_bam}')
 
         bam1, bam2 = split_bam(pseudo_bam, f'{basename}.pseudo.01.bam', f'{basename}.pseudo.02.bam')
         return bam1, bam2
 
     pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds = [], [], []
-    keys, names = [], []
-    for sample1, sample2 in itertools.combinations(SAMPLES, 2):
-        ip_bam1, ip_bam2 = sample1.ip_read.bam, sample2.ip_read.bam
-        ip_basename = f'{ECLIP}/{sample1.key}.{sample2.key}.ip'
-        keys.append(sample1.key)
-        names.append(os.path.basename(ip_basename))
-        pseudo_ip_bam = prepare_pseudo_bam(ip_bam1, ip_bam2, ip_basename)
+    for i, (sample1, sample2) in enumerate(itertools.combinations(SAMPLES, 2), start=1):
+        pseudo_ip_bam = prepare_pseudo_bam(sample1.ip_read.bam, sample2.ip_read.bam,
+                                           f'rescue/{sample1.ip_read.name}.{sample2.ip_read.name}')
         pseudo_ip_bams.extend(pseudo_ip_bam)
 
+        pseudo_input_bam = prepare_pseudo_bam(sample1.input_read.bam, sample2.input_read.bam,
+                                              f'rescue/{sample1.input_read.name}.{sample2.input_read.name}')
+        pseudo_input_bams.extend(pseudo_input_bam)
+        
         pseudo_peak_beds.extend([clipper_peaks(bam) for bam in pseudo_ip_bam])
 
-        input_bam1, input_bam2 = sample1.input_read.bam, sample2.input_read.bam
-        input_basename = f'{ECLIP}/{sample1.key}.{sample2.key}.input'
-        pseudo_input_bam = prepare_pseudo_bam(input_bam1, input_bam2, input_basename)
-        pseudo_input_bams.extend(pseudo_input_bam)
+    key = ".vs.".join([sample.ip_read.name for sample in SAMPLES])
+    pseudo_reproducible_bed = f'rescue/{key}.reproducible.peaks.bed'
+    peak(pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds, pseudo_reproducible_bed)
+    pseudo_count = count_lines(pseudo_reproducible_bed)
+    
+    count = count_lines(f'{ECLIP}/{key}.reproducible.peaks.bed')
+    try:
+        ratio = max(count, pseudo_count) / min(count, pseudo_count)
+    except ZeroDivisionError:
+        ratio = 0
+        logger.error(f'No peaks found in reproducible peaks or pseudo reproducible peaks, return ratio 0.')
+    with open(outputs, 'w') as o1, open(outputs.replace(f'{ECLIP}/', 'rescue/'), 'w') as o2:
+        o1.write(f'{ratio}\n')
+        o2.write(f'{ratio}\n')
 
-    peak(pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds)
 
-    count = count_lines(f'{ECLIP}/{".vs.".join(keys)}.reproducible.peaks.bed')
-    pseudo_count = count_lines(f'{ECLIP}/{".vs.".join(names)}.reproducible.peaks.bed')
-    ratio = max(count, pseudo_count) / min(count, pseudo_count)
-    with open(outputs, 'w') as o:
-        o.write(f'{ratio}')
-
-
-@task(inputs=[], outputs=f'{ECLIP}/consistency.ratio.txt', parent=clipper)
+@task(inputs=[], outputs=f'{ECLIP}/consistency.ratio.txt', parent=clipper, mkdir_before_run=['consistency'])
 def consistency_ratio(inputs, outputs):
     counts = []
-    for (ip_read, input_read) in SAMPLES:
-        names = [f'{ip_read.key}.split.{i:02d}' for i in range(2)]
-        ip_bam1, ip_bam2 = [f'{ECLIP}/{name}.ip.bam' for name in names]
-        split_ip_bams = split_bam(ip_read.bam, ip_bam1, ip_bam2)
-
+    for sample in SAMPLES:
+        split_ip_bams = split_bam(sample.ip_read.bam,
+                                  f'consistency/{sample.ip_read.name}.split.01.bam',
+                                  f'consistency/{sample.ip_read.name}.split.02.bam')
+        split_input_bams = split_bam(sample.input_read.bam,
+                                     f'consistency/{sample.input_read.name}.split.01.bam',
+                                     f'consistency/{sample.input_read.name}.split.02.bam')
         split_peak_beds = [clipper_peaks(split_ip_bams[0]), clipper_peaks(split_ip_bams[1])]
 
-        input_bam1, input_bam2 = [f'{ECLIP}/{name}.input.bam' for name in names]
-        split_input_bams = split_bam(input_read.bam, input_bam1, input_bam2)
+        reproducible_bed = f'consistency/{sample.key}.split.reproducible.peaks.bed'
+        peak(split_ip_bams, split_input_bams, split_peak_beds, reproducible_bed)
+        counts.append(count_lines(reproducible_bed))
 
-        peak(split_ip_bams, split_input_bams, split_peak_beds)
-        counts.append(count_lines(f'{ECLIP}/{".vs.".join(names)}.reproducible.peaks.bed'))
-
-    ratio = counts[0] / counts[1]
-    with open(outputs, 'w') as o:
-        o.write(f'{ratio}')
+    try:
+        ratio = counts[0] / counts[1]
+    except ZeroDivisionError:
+        ratio = 0
+        logger.error(f'No peaks found in one of the split reproducible peaks, return ratio 0.')
+    with open(outputs, 'w') as o1, open(outputs.replace(f'{ECLIP}/', 'consistency/'), 'w') as o2:
+        o1.write(f'{ratio}\n')
+        o2.write(f'{ratio}\n')
 
 
 def prepare_fastqs():
@@ -950,8 +950,8 @@ def prepare_fastqs():
     return fastqs
 
 
-@task(inputs=prepare_fastqs(), outputs=lambda i: i.replace(f'{ECLIP}/', f'{QC}/').replace('.fastq.gz', '.fastq.qc.txt'),
-      parent=consistency_ratio, mkdir_before_run=['qc'])
+# @task(inputs=prepare_fastqs(), outputs=lambda i: i.replace(f'{ECLIP}/', f'{QC}/').replace('.fastq.gz', '.fastq.qc.txt'),
+#       parent=consistency_ratio, mkdir_before_run=['qc'])
 def falco(fastq, txt):
     tmp = tempfile.mkdtemp(suffix='_qc', prefix='falco_', dir=QC)
     cmd = f'falco --outdir {tmp} --skip-html {fastq}'
@@ -997,17 +997,17 @@ def summary():
             for line in f:
                 if 'Number of input reads' in line:
                     reads = int(line.strip().split('\t')[-1])
-                if 'Uniquely mapped reads number' in line:
+                elif 'Uniquely mapped reads number' in line:
                     counts.append(int(line.strip().split('\t')[-1]))
-                if 'Number of reads mapped to multiple loci' in line:
+                elif 'Number of reads mapped to multiple loci' in line:
                     counts.append(int(line.strip().split('\t')[-1]))
-                if 'Number of reads mapped to too many loci' in line:
+                elif 'Number of reads mapped to too many loci' in line:
                     counts.append(int(line.strip().split('\t')[-1]))
-                if '% of reads unmapped: too many mismatches' in line:
+                elif '% of reads unmapped: too many mismatches' in line:
                     counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
-                if '% of reads unmapped: too short' in line:
+                elif '% of reads unmapped: too short' in line:
                     counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
-                if '% of reads unmapped: other' in line:
+                elif '% of reads unmapped: other' in line:
                     counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
         return counts
 
