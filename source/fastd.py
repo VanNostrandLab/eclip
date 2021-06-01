@@ -11,6 +11,7 @@ import argparse
 import re
 # from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 # from functools import partial
+import cmder
 
 from Bio.SeqIO.QualityIO import FastqGeneralIterator
 
@@ -18,6 +19,7 @@ parser = argparse.ArgumentParser(description='Process some integers.')
 parser.add_argument('--fastqs', nargs='+', help='Path to the first read (r1) and second read (r2) fastq files.')
 parser.add_argument('--barcodes', nargs='+', help='Names of the barcodes.')
 parser.add_argument('--basename', type=str, help='Basename of the output file.')
+parser.add_argument('--lines', type=int, help='Maximum number of line for split files.', default=1000000)
 parser.add_argument('--cores', type=int, help='Number of CPU cores can be used.', default=8)
 parser.add_argument('--randomer_length', type=int, help='Length of the randomer, default: 5.', default=5)
 parser.add_argument('--allow_mismatch', type=int, help='Maximum number of base allowed for barcode mismatching.',
@@ -92,9 +94,10 @@ def barcoding(read, max_barcode_length=0, randomer_length=0, allow_mismatch=0):
     matches = [match for match in matches if match]
     if matches:
         barcode, barcode_length, _ = sorted(matches, key=lambda x: x[2])[0]
+        r1 = f'@{seq2[:randomer_length]}:{name1}\n{seq1[barcode_length:]}\n+\n{quality1[barcode_length:]}\n'
     else:
         barcode, barcode_length = 'NIL', randomer_length
-    r1 = f'@{seq2[:randomer_length]}:{name1}\n{seq1[barcode_length:]}\n+\n{quality1[barcode_length:]}\n'
+        r1 = f'@{seq2[:randomer_length]}:{name1}\n{seq1}\n+\n{quality1}\n'
     r2 = f'@{seq2[:randomer_length]}:{name2}\n{seq2[randomer_length:]}\n+\n{quality2[randomer_length:]}\n'
     return barcode, r1, r2
 
