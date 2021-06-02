@@ -8,10 +8,13 @@ A pipeline for processing eCLIP data to identify genomic locations of RNA bindin
 import argparse
 import os
 import glob
+import gzip
 import sys
 import time
 import subprocess
 import json
+from collections import defaultdict
+
 import yaml
 import datetime
 import tempfile
@@ -23,6 +26,7 @@ import pysam
 import cmder
 import pandas as pd
 from seqflow import Flow, task, logger
+from Bio.SeqIO.QualityIO import FastqGeneralIterator
 
 
 class CustomFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -48,6 +52,7 @@ sp.add_argument('--species', type=str, help="Species name (short name code) the 
 sp.add_argument('--barcodes_fasta', type=str, help="Path to the fasta file contains barcodes and their sequences.")
 sp.add_argument('--blacklist_bed', type=str, help="Path to the bed file contains blacklist.")
 sp.add_argument('--randomer_length', type=int, help="Length (int) of the randomer.")
+sp.add_argument('--allow_mismatch', type=int, help="Allowed mismatch among barcodes for demultiplexing.")
 sp.add_argument('--track', type=str, help="Name for the UCSC Genome Browser track, default: eCLIP", default='eCLIP')
 sp.add_argument('--track_label', type=str, help="Label for the track.", default='eCLIP')
 sp.add_argument('--track_genome', type=str, help="Genome name (a short name code) for the track.", default='hg19')
@@ -113,7 +118,8 @@ def parse_and_sanitize_options():
     if not os.path.isfile(options.barcodes_fasta):
         raise ValueError(f'Barcodes fasta {options.barcodes_fasta} is not a file or does not exist.')
 
-    setattr(options, 'randomer_length', options.randomer_length or manifest.get('randomer_length', '5'))
+    setattr(options, 'randomer_length', options.randomer_length or int(manifest.get('randomer_length', 10)))
+    setattr(options, 'allow_mismatch', options.allow_mismatch or int(manifest.get('allow_mismatch', 1)))
 
     blacklist_bed = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hg19.blacklist.bed')
     setattr(options, 'blacklist_bed', options.blacklist_bed or manifest.get('blacklist_bed', blacklist_bed))
@@ -141,14 +147,14 @@ class Read:
         if not self.name:
             raise KeyError(f'No name was assigned for {self.type}\nread {record}.')
         self.fastq1 = record.get('fastq', '') or record.get('fastq1', '')
-        if self.fastq1:
-            if not os.path.isfile(self.fastq1):
-                raise ValueError(f'{self.fastq1} may not be a file or does not exist.')
-        else:
-            raise KeyError(f'No fastq or fastq1 was assigned for {self.type} read\n{record}.')
+        # if self.fastq1:
+        #     if not os.path.isfile(self.fastq1):
+        #         raise ValueError(f'{self.fastq1} may not be a file or does not exist.')
+        # else:
+        #     raise KeyError(f'No fastq or fastq1 was assigned for {self.type} read\n{record}.')
         self.fastq2 = record.get('fastq2', '')
-        if self.fastq2 and not os.path.isfile(self.fastq2):
-            raise ValueError(f'{self.fastq2} may not be a file or does not exist.')
+        # if self.fastq2 and not os.path.isfile(self.fastq2):
+        #     raise ValueError(f'{self.fastq2} may not be a file or does not exist.')
         self.barcodes = record.get('barcodes', ['', ''])
         self.adapters = record.get('adapters', '')
 
@@ -200,13 +206,13 @@ def size(file, formatting=True):
 
 def parse_and_validate_samples():
     def estimate_max_processes():
-        max_size = max(sizes) / (1024 * 1024 * 1024) * 2
-        n = int(options.memory / max_size)
-        if n == 0:
-            n = 1
-        elif n > options.cores:
-            n = options.cores
-        return n
+        # max_size = max(sizes) / (1024 * 1024 * 1024) * 2
+        # n = int(options.memory / max_size)
+        # if n == 0:
+        #     n = 1
+        # elif n > options.cores:
+        #     n = options.cores
+        return options.cores
 
     samples, reads, sizes, types, names = [], {}, [], [], set()
     for i, sample in enumerate(options.manifest.get('samples', []), 1):
@@ -276,20 +282,65 @@ def umi_extract_or_barcode_demux(link):
     return f'{ECLIP}/{key}.{barcode}.r1.fastq.gz'
 
 
+def demux(fastq1, fastq2, basename, barcodes):
+    """Demultiplex paired-end reads."""
+    def hamming(key, barcode, seq, allow_mismatch):
+        mismatch = len(barcode) - sum(x == y or x == 'N' or y == 'N' for x, y in zip(barcode, seq))
+        return (key, len(barcode), mismatch) if mismatch <= allow_mismatch else None
+
+    logger.info(f'Demultiplexing {fastq1} and {fastq2} with barcodes {" and ".join(barcodes)} ...')
+    barcodes_dict = {'A01': 'AAGCAAT',
+                     'A03': 'ATGACCNNNNT',
+                     'A04': 'CAGCTTNNNNT',
+                     'B06': 'GGCTTGT',
+                     'C01': 'ACAAGTT',
+                     'D8f': 'TGGTCCT',
+                     'F05': 'GGATACNNNNT',
+                     'G07': 'TCCTGTNNNNT',
+                     'X1A': 'NNNNNCCTATAT',
+                     'X1B': 'NNNNNTGCTATT',
+                     'X2A': 'NNNNNTATACTT',
+                     'X2B': 'NNNNNATCTTCT'}
+    allow_mismatch, randomer_length = options.allow_mismatch, options.randomer_length
+    print(allow_mismatch, randomer_length)
+    max_barcode_length = max(len(barcode) for barcode in barcodes_dict.values())
+    writers = {barcode: (gzip.open(f'{basename}.{barcode}.r1.fastq.gz', 'wt'),
+                         gzip.open(f'{basename}.{barcode}.r2.fastq.gz', 'wt'))
+               for barcode in set(barcodes)}
+    with gzip.open(fastq1, 'rt') as f1, gzip.open(fastq2, 'rt') as f2:
+        for i, (read1, read2) in enumerate(zip(FastqGeneralIterator(f1), FastqGeneralIterator(f2))):
+            (name1, seq1, quality1), (name2, seq2, quality2) = read1, read2
+            n1, n2 = name1.split()[0], name2.split()[0]
+            assert n1 == n2, ValueError(f'Paired-End reads have mismatch names: {name1} != {name2}')
+
+            matches = (hamming(key, barcode, seq1[:max_barcode_length], allow_mismatch)
+                       for key, barcode in barcodes_dict.items())
+            matches = [match for match in matches if match]
+            if matches:
+                barcode, barcode_length, _ = sorted(matches, key=lambda x: x[2])[0]
+                r1 = f'@{seq2[:randomer_length]}:{name1}\n{seq1[barcode_length:]}\n+\n{quality1[barcode_length:]}\n'
+            else:
+                barcode = 'NIL'
+                r1 = f'@{seq2[:randomer_length]}:{name1}\n{seq1}\n+\n{quality1}\n'
+            r2 = f'@{seq2[:randomer_length]}:{name2}\n{seq2[randomer_length:]}\n+\n{quality2[randomer_length:]}\n'
+
+            if barcode in writers:
+                writer1, writer2 = writers[barcode]
+                writer1.write(r1)
+                writer2.write(r2)
+            if i > 50000:
+                break
+    _ = [[v[0].close(), v[1].close()] for v in writers.values()]
+    logger.info(f'Demultiplexing {fastq1} and {fastq2} with barcodes {" and ".join(barcodes)} complete.')
+
+
 @task(inputs=soft_link, outputs=lambda i: umi_extract_or_barcode_demux(i), processes=options.cores)
 def prepare_reads(link, output):
     """Extract UMIs for single-end reads or demultiplex paired-end reads."""
     read = READS[os.path.basename(link.replace('.r1.fastq.gz', ''))]
     fastq1, fastq2 = read.link1, read.link2
     if fastq2:
-        barcodes = read.barcodes
-        message = f'Demultiplexing paired-end reads {fastq1} {size(fastq1)} and\n{" " * 43}{fastq2} {size(fastq2)} ...'
-        cmd = ['fastd.py',
-               '--fastqs', fastq1, fastq2,
-               '--barcodes', barcodes[0], barcodes[1],
-               '--basename', fastq1.replace('.r1.fastq.gz', ''),
-               '--randomer_length', options.randomer_length, '--gz']
-        cmder.run(cmd, msg=message, pmt=True)
+        demux(fastq1, fastq2, fastq1.replace('.r1.fastq.gz', ''), read.barcodes)
     else:
         message = f'Extract UMIs for single-end read {fastq1} {size(fastq1)} ...'
         cmd = ['umi_tools', 'extract',
@@ -540,17 +591,43 @@ def prepare_bam(bam, out):
         name_sort_bam(bam, out)
 
 
+def collapse_barcode(bam, out):
+    logger.info(f'Deduplicating {bam} {size(bam)} by collapsing barcodes ...')
+    verbosity = pysam.set_verbosity(0)
+    with pysam.AlignmentFile(bam, 'rb') as b1, pysam.AlignmentFile(bam, 'rb') as b2:
+        results = {}
+        for read1, read2 in zip(itertools.islice(b1, 0, None, 2), itertools.islice(b2, 1, None, 2)):
+            if read1.query_name != read2.query_name:
+                raise ValueError(f'Read names do not match: {read1.query_name} != {read2.query_name}.')
+            if read1.is_unmapped or read2.is_unmapped or read1.reference_name != read2.reference_name:
+                continue
+            if not read1.is_read1:
+                read1, read2 = read2, read1
+            randomer = read1.query_name.split(':')[0]
+            start = read1.positions[-1] if read1.is_reverse else read1.pos
+            stop = read2.positions[-1] if read2.is_reverse else read2.pos
+            strand = '-' if read1.is_reverse else '+'
+            location = (read1.reference_name, start, stop, strand, randomer)
+            if location in results:
+                continue
+            results[location] = (read1, read2)
+        with pysam.AlignmentFile(out, 'wb', template=b1) as o:
+            for (read1, read2) in results.values():
+                o.write(read1)
+                o.write(read2)
+        logger.info(f'Deduplicating {bam} {size(bam)} by collapsing barcodes complete.')
+    pysam.set_verbosity(verbosity)
+
+
 @task(inputs=prepare_bam, outputs=lambda i: i.replace('.sort.bam', '.sort.dedup.bam'), processes=options.cores)
 def dedup_bam(bam, out):
     """Collapse barcodes of paired-end bam or umi_tools dedup single-end bam."""
     if TYPE == 'single':
-        cmd = ['umi_tools', 'dedup', '--random-seed', 1, '--stdin', bam, '--method', 'unique',
-               '--output-stats', out.replace(".dedup.bam", ".dedup.metrics"), '--stdout', out]
+        cmd = ['umi_tools', 'dedup', '--random-seed', 1, '--stdin', bam, '--method', 'unique', '--stdout', out]
         message = f'Deduplicating {bam} {size(bam)} by umi_tools dedup ...'
+        cmder.run(cmd, msg=message, pmt=True)
     else:
-        cmd = f'barcode_collapse.py -o {out} -m {out.replace(".bam", ".collapse.metrics")} -b {bam}'
-        message = f'Deduplicating {bam} {size(bam)} by collapsing barcodes ...'
-    cmder.run(cmd, msg=message, pmt=True)
+        collapse_barcode(bam, out)
 
 
 @task(inputs=dedup_bam, outputs=lambda i: i.replace('.sort.dedup.bam', '.sort.dedup.sort.bam'))
@@ -978,19 +1055,17 @@ def summary(inputs, outputs):
         return sample, reads, duplicate
 
     def parse_cutadapt_metrics(metrics):
-        sample, reads, reads_too_short = os.path.basename(metrics).split('.trim.')[0], 0, 0
+        reads, reads_too_short = 0, 0
         with open(metrics) as f:
             for line in f:
                 if ('Reads written (passing filters)' in line) or ('Pairs written (passing filters)' in line):
                     reads = int(line.strip().split()[-2].replace(',', ''))
                 elif ('Reads that were too short' in line) or ('Pairs that were too short' in line):
                     reads_too_short = int(line.strip().split()[-2].replace(',', ''))
-        return sample, reads, reads_too_short
+        return os.path.basename(metrics).split('.trim.')[0], reads, reads_too_short
 
     def parse_star_log(log):
-        columns = ['Uniquely mapped', 'Mapped to multiple loci', 'Mapped to too many loci',
-                   'Unmapped: too many mismatches', 'Unmapped: too short', 'Unmapped: other']
-        counts, reads = [os.path.basename(os.path.dirname(log))], 0
+        counts = [os.path.basename(os.path.dirname(log))]
         with open(log) as f:
             for line in f:
                 if 'Number of input reads' in line:
@@ -1010,47 +1085,75 @@ def summary(inputs, outputs):
         return counts
 
     def get_dedup_metrics(bam1, bam2):
-        sample = os.path.basename(bam1).replace('.sort.bam', '')
         n, _ = cmder.run(f'samtools view -c -F 0x4 {bam1}', msg='')
         n2, _ = cmder.run(f'samtools view -c -F 0x4 {bam2}', msg='')
-        return sample, int(n) - int(n2), int(n2)
+        return os.path.basename(bam1).replace('.sort.bam', ''), int(n) - int(n2), int(n2)
 
     def get_usable_reads(bam):
-        sample = os.path.basename(bam1).replace('.bam', '')
-        return sample, int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='')[0])
+        return os.path.basename(bam1).replace('.bam', ''), int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='')[0])
 
-    raw_reads, demux_reads, cut1, cut2 = [], [], [], []
-    repeat_map, genome_map, dedup_reads, usable_reads = [], [], [], []
+    raw_reads, demux_reads, cut1, cut2 = defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list)
+    repeat_map, genome_map = defaultdict(list), defaultdict(list)
+    dedup_reads, usable_reads = defaultdict(list), defaultdict(list)
     for key, read in READS.items():
-        raw_reads.append(parse_falco_metrics(f'{QC}/{key}.r1.fastq.qc.txt'))
+        sample, unique_reads, duplicate_reads = parse_falco_metrics(f'{QC}/{key}.r1.fastq.qc.txt')
+        raw_reads['Sample'].append(sample)
+        raw_reads['Unique Reads'].append(unique_reads)
+        raw_reads['Duplicate Reads'].append(duplicate_reads)
         barcodes = read.barcodes if read.link2 else ['umi']
         if read.link2:
-            raw_reads.append(parse_falco_metrics(f'{QC}/{key}.r2.fastq.qc.txt'))
+            sample, unique_reads, duplicate_reads = parse_falco_metrics(f'{QC}/{key}.r2.fastq.qc.txt')
+            raw_reads['Sample'].append(sample)
+            raw_reads['Unique Reads'].append(unique_reads)
+            raw_reads['Duplicate Reads'].append(duplicate_reads)
             for barcode in set(read.barcodes):
-                demux_reads.append(parse_falco_metrics(f'{QC}/{key}.{barcode}.r1.fastq.qc.txt'))
-                demux_reads.append(parse_falco_metrics(f'{QC}/{key}.{barcode}.r2.fastq.qc.txt'))
+                sample, unique_reads, duplicate_reads = parse_falco_metrics(f'{QC}/{key}.{barcode}.r1.fastq.qc.txt')
+                demux_reads['Sample'].append(sample)
+                demux_reads['Unique Reads'].append(unique_reads)
+                demux_reads['Duplicate Reads'].append(duplicate_reads)
+                sample, unique_reads, duplicate_reads = parse_falco_metrics(f'{QC}/{key}.{barcode}.r2.fastq.qc.txt')
+                demux_reads['Sample'].append(sample)
+                demux_reads['Unique Reads'].append(unique_reads)
+                demux_reads['Duplicate Reads'].append(duplicate_reads)
 
         for barcode in set(barcodes):
             cut1_metrics = f'{ECLIP}/{key}.{barcode}.trim.first.metrics'
-            cut1.append(parse_cutadapt_metrics(cut1_metrics))
+            sample, passed_reads, failed_reads = parse_cutadapt_metrics(cut1_metrics)
+            cut1['Sample'].append(sample)
+            cut1['Passed Reads'].append(passed_reads)
+            cut1['Failed Reads'].append(failed_reads)
             # shutil.move(cut1_metrics, cut1_metrics.replace(f'{ECLIP}/', f'{QC}/'))
 
             cut2_metrics = f'{ECLIP}/{key}.{barcode}.trim.second.metrics'
-            cut2.append(parse_cutadapt_metrics(cut2_metrics))
+            sample, passed_reads, failed_reads = parse_cutadapt_metrics(cut2_metrics)
+            cut2['Sample'].append(sample)
+            cut2['Passed Reads'].append(passed_reads)
+            cut2['Failed Reads'].append(failed_reads)
             # shutil.move(cut2_metrics, cut2_metrics.replace(f'{ECLIP}/', f'{QC}/'))
 
+            names = ['Sample', 'Uniquely mapped', 'Mapped to multiple loci', 'Mapped to too many loci',
+                     'Unmapped: too many mismatches', 'Unmapped: too short', 'Unmapped: other']
             repeat_map_log = f'{ECLIP}/repeat.elements.map/{key}.{barcode}/Log.final.out'
-            repeat_map.append(parse_star_log(repeat_map_log))
+            counts = parse_star_log(repeat_map_log)
+            for i, name in enumerate(names):
+                repeat_map[name].append(counts[i])
             # shutil.move(repeat_map_log, f'{QC}/{key}.{barcode}.repeat.element.map.log')
 
             genome_map_log = f'{ECLIP}/reference.genome.map/{key}.{barcode}/Log.final.out'
-            genome_map.append(parse_star_log(genome_map_log))
+            counts = parse_star_log(genome_map_log)
+            for i, name in enumerate(names):
+                genome_map[name].append(counts[i])
             # shutil.move(genome_map_log, f'{QC}/{key}.{barcode}.reference.genome.map.log')
 
             bam1, bam2 = f'{ECLIP}/{key}.{barcode}.sort.bam', f'{ECLIP}/{key}.{barcode}.sort.dedup.sort.bam'
-            dedup_reads.append(get_dedup_metrics(bam1, bam2))
+            sample, unique_reads, duplicate_reads = get_dedup_metrics(bam1, bam2)
+            dedup_reads['Sample'].append(sample)
+            dedup_reads['Unique Reads'].append(unique_reads)
+            dedup_reads['Duplicate Reads'].append(duplicate_reads)
 
-            usable_reads.append([f'{key}.{barcode}', get_usable_reads(f'{ECLIP}/{key}.bam')])
+            counts = get_usable_reads(f'{ECLIP}/{key}.bam')
+            usable_reads['Sample'] = counts[0]
+            usable_reads['Usable Reads'] = counts[1]
 
     counts = {'raw_reads': raw_reads, 'demux_reads': demux_reads, 'cut1': cut1, 'cut2': cut2,
               'repeat_map': repeat_map, 'genome_map': genome_map,
@@ -1165,10 +1268,142 @@ def main():
         logger.debug('')
         run_time = str(datetime.timedelta(seconds=int(time.perf_counter() - START_TIME)))
         logger.trace(FOOTER.format(hh_mm_ss=f'time consumed: {run_time}'.upper().center(118)))
+        
+        
+def dataset_basic():
+    data = [['Data Type', 'Sample', 'Description', 'Replicate', 'Library Type', 'Barcodes']]
+    library_type = 'PE' if TYPE == 'paired' else 'SE'
+    for i, sample in enumerate(SAMPLES, 1):
+        data.append(['eCLIP', sample.ip_read.key, 'IP', i, library_type, ', '.join(sample.ip_read.barcodes)])
+        data.append(['eCLIP', sample.input_read.key, 'INPUT', i, library_type, ', '.join(sample.input_read.barcodes)])
+    return data
+
+
+# from bokeh.io import output_file, show
+# from bokeh.models import ColumnDataSource, FactorRange, NumeralTickFormatter, Legend
+# from bokeh.plotting import figure
+# from bokeh.models.widgets import Tabs, Panel
+#
+# import datapane as dp
+
+
+def bar_plot(data, data_type, tooltips, colors):
+    samples, categories = data['Samples'], [key for key in data.keys if key != 'Samples']
+    fig = figure(y_range=FactorRange(factors=samples[::-1]), plot_height=250, toolbar_location=None, tooltips=tooltips)
+    fig.add_layout(Legend(), 'right')
+    fig.hbar_stack(categories, y='Samples', height=0.8, color=colors, legend_label=categories,
+                   source=ColumnDataSource(data))
+    fig.x_range.start = 0
+    fig.x_range.range_padding = 0.1
+    formatter = NumeralTickFormatter(format="0 a") if data_type == 'counts' else NumeralTickFormatter(format="0,0")
+    fig.xaxis[0].formatter = formatter
+    fig.xaxis.axis_label = 'Number of reads' if data_type == 'counts' else 'Percent of reads (%)'
+    fig.xaxis.axis_line_color = None
+    fig.y_range.range_padding = 0.1
+    fig.yaxis.axis_line_color = None
+    fig.ygrid.grid_line_color = None
+    fig.legend.border_line_color = None
+    fig.axis.minor_tick_line_color = None
+    fig.axis.major_tick_line_color = None
+    fig.outline_line_color = None
+    return fig
+
+
+def count_percent_plot(counts, tooltips=None, colors=("#718dbf", "#e84d60")):
+    if tooltips:
+        count_tooltips, percent_tooltips = tooltips
+    else:
+        count_tooltips = [("Sample", "@samples"), ("Unique Reads", "@{Unique Reads}{0.00 a}"),
+                          ("Duplicate Reads", "@{Duplicate Reads}{0.00 a}")]
+        percent_tooltips = [("Sample", "@samples"), ("Unique Reads (%)", "@{Unique Reads}{0.00}"),
+                            ("Duplicate Reads (%)", "@{Duplicate Reads}{0.00}")]
+    count_figure = bar_plot(counts, 'counts', count_tooltips, colors)
+    df = pd.DataFrame(counts)
+    df = df.set_index('Samples')
+    df = df.div(df.sum(axis=1), axis=0)
+    df.reset_index()
+    counts = {column: df[column].tolist() for column in df.columns}
+    percent_figure = bar_plot(counts, 'percent', percent_tooltips, colors)
+
+    count_panel = Panel(child=count_figure, title='Count')
+    percent_panel = Panel(child=percent_figure, title='Percentage')
+
+    tabs = Tabs(tabs=[count_panel, percent_panel])
+    
+    return tabs
+    
+
+# def plot_raw_reads(counts):
+#     samples, categories, uniques, duplicates = [], ['Unique Reads', 'Duplicate Reads'], [], []
+#     unique_percents, duplicate_percents = [], []
+#     for sample, count, percent in counts:
+#         samples.append(sample)
+#         duplicate = int(count * percent / 100)
+#         duplicates.append(duplicate)
+#         uniques.append(count - duplicate)
+#         unique_percents.append(100 - percent)
+#         duplicate_percents.append(percent)
+#     counts = {'samples': samples, 'Unique Reads': uniques, 'Duplicate Reads': duplicates}
+#     percents = {'samples': samples, 'Unique Reads': unique_percents, 'Duplicate Reads': duplicate_percents}
+#
+#     # output_file("/Users/fei/Downloads/work/software/tmp/stacked_split.html")
+#
+#     tooltips = [("Sample", "@samples"), ("Unique Reads", "@{Unique Reads}{0.00 a}"),
+#                 ("Duplicate Reads", "@{Duplicate Reads}{0.00 a}")]
+#     count_fig = figure(y_range=FactorRange(factors=samples[::-1]), plot_height=250,
+#                        toolbar_location=None, tooltips=tooltips)
+#
+#     count_fig.add_layout(Legend(), 'right')
+#     count_fig.hbar_stack(categories, y='samples', height=0.8, color=["#718dbf", "#e84d60"], legend_label=categories,
+#                          source=ColumnDataSource(counts))
+#
+#     count_fig.x_range.start = 0
+#     count_fig.x_range.range_padding = 0.1
+#     count_fig.xaxis[0].formatter = NumeralTickFormatter(format="0 a")
+#     count_fig.xaxis.axis_label = 'Number of reads'
+#     count_fig.xaxis.axis_line_color = None
+#     count_fig.y_range.range_padding = 0.1
+#     count_fig.yaxis.axis_line_color = None
+#     count_fig.ygrid.grid_line_color = None
+#     count_fig.legend.border_line_color = None
+#     count_fig.axis.minor_tick_line_color = None
+#     count_fig.axis.major_tick_line_color = None
+#     count_fig.outline_line_color = None
+#
+#     tooltips = [("Sample", "@samples"), ("Unique Reads (%)", "@{Unique Reads}{0.00}"),
+#                 ("Duplicate Reads (%)", "@{Duplicate Reads}{0.00}")]
+#     percent_fig = figure(y_range=FactorRange(factors=samples[::-1]), plot_height=250, toolbar_location=None,
+#                          tooltips=tooltips)
+#     percent_fig.add_layout(Legend(), 'right')
+#     percent_fig.hbar_stack(categories, y='samples', height=0.8, color=["#718dbf", "#e84d60"],
+#                            legend_label=categories, source=ColumnDataSource(percents))
+#     percent_fig.x_range.start = 0
+#     percent_fig.x_range.range_padding = 0.1
+#     percent_fig.xaxis[0].formatter = NumeralTickFormatter(format="0,0")
+#     percent_fig.xaxis.axis_label = 'Percent of reads (%)'
+#     percent_fig.xaxis.axis_line_color = None
+#     percent_fig.y_range.range_padding = 0.1
+#     percent_fig.yaxis.axis_line_color = None
+#     percent_fig.ygrid.grid_line_color = None
+#     percent_fig.legend.border_line_color = None
+#     percent_fig.axis.minor_tick_line_color = None
+#     percent_fig.axis.major_tick_line_color = None
+#     percent_fig.outline_line_color = None
+#
+#     count_panel = Panel(child=count_fig, title='Count')
+#     percent_panel = Panel(child=percent_fig, title='Percentage')
+#
+#     tabs = Tabs(tabs=[count_panel, percent_panel])
+#
+#     # dp.Report("## Vaccination Report",
+#     #           dp.Plot(tabs, caption="Vaccinations by manufacturer over time"),
+#     #           ).save(path='/Users/fei/Downloads/work/software/tmp/report.html', open=True)
+#
+#     # show(tabs)
+#     return tabs
 
 
 if __name__ == '__main__':
-    main()
-    # for fastq in prepare_fastqs():
-    #     falco(fastq, fastq.replace(f'{ECLIP}/', f'{QC}/').replace('.fastq.gz', '.fastq.qc.txt'))
-    # summary()
+    pass
+    collapse_barcode('/storage/vannostrand/analysis/20210528_Deniz/eclip/K002000195.80891.X1A.r1.fq.genome-mappedSo.bam',
+                     '/storage/vannostrand/software/eclip/test/fastd/dedup.bam')
