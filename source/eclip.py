@@ -27,6 +27,11 @@ import cmder
 import pandas as pd
 from seqflow import Flow, task, logger
 from Bio.SeqIO.QualityIO import FastqGeneralIterator
+from bokeh.models import ColumnDataSource, FactorRange, NumeralTickFormatter, Legend
+from bokeh.plotting import figure
+from bokeh.io import curdoc
+from bokeh.models.widgets import Tabs, Panel
+import datapane as dp
 
 
 class CustomFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -205,15 +210,6 @@ def size(file, formatting=True):
 
 
 def parse_and_validate_samples():
-    def estimate_max_processes():
-        # max_size = max(sizes) / (1024 * 1024 * 1024) * 2
-        # n = int(options.memory / max_size)
-        # if n == 0:
-        #     n = 1
-        # elif n > options.cores:
-        #     n = options.cores
-        return options.cores
-
     samples, reads, sizes, types, names = [], {}, [], [], set()
     for i, sample in enumerate(options.manifest.get('samples', []), 1):
         ip_read, input_read = sample.get('ip_read', {}), sample.get('input_read', {})
@@ -238,11 +234,12 @@ def parse_and_validate_samples():
     if not samples:
         raise KeyError('Manifest file misses key samples or does not contain any samples.')
     assert len(set(types)) == 1, ValueError('Reads mixed with single-end and paired-end fastq file specifications.')
-    return samples, reads, estimate_max_processes(), 'paired' if types[0] else 'single'
+    return samples, reads, len(samples), 'paired' if types[0] else 'single'
 
 
 HASH = 100000
 SAMPLES, READS, PROCESSES, TYPE = parse_and_validate_samples()
+CORES = max(int(options.cores / PROCESSES), 1)
 VERSION = 1.0
 HEADER = fr"""
                            ____   _       ___   ____
@@ -302,7 +299,6 @@ def demux(fastq1, fastq2, basename, barcodes):
                      'X2A': 'NNNNNTATACTT',
                      'X2B': 'NNNNNATCTTCT'}
     allow_mismatch, randomer_length = options.allow_mismatch, options.randomer_length
-    print(allow_mismatch, randomer_length)
     max_barcode_length = max(len(barcode) for barcode in barcodes_dict.values())
     writers = {barcode: (gzip.open(f'{basename}.{barcode}.r1.fastq.gz', 'wt'),
                          gzip.open(f'{basename}.{barcode}.r2.fastq.gz', 'wt'))
@@ -362,7 +358,7 @@ def umi_extract_or_barcode_demux_outputs():
 
 
 @task(inputs=umi_extract_or_barcode_demux_outputs(), outputs=lambda i: i.replace('.r1.fastq.gz', '.trim.r1.fastq'),
-      parent=prepare_reads)
+      parent=prepare_reads, processes=PROCESSES)
 def cut_adapt(r1, fastq):
     def parse_adapters(flag, fasta):
         adapters = []
@@ -418,7 +414,7 @@ def cut_adapt(r1, fastq):
         return ios1, ios2, msg1, msg2
 
     def trim_adapters(adapters, overlap, ios, message):
-        cmd = ['cutadapt', '-O', overlap, '-j', options.cores, '--match-read-wildcards', '--times', 1,
+        cmd = ['cutadapt', '-O', overlap, '-j', CORES, '--match-read-wildcards', '--times', 1,
                '-e', 0.1, '--quality-cutoff', 6, '-m', 18] + adapters + ios
         cmder.run(cmd, msg=message, pmt=True)
 
@@ -776,8 +772,9 @@ def clipper(bam, bed):
 def pureclip(bam, bed):
     ip_bam, input_bam = [[sample.ip_read.bam, sample.input_read.bam] for sample in SAMPLES
                          if sample.ip_read.bam == bam][0]
+    # '-iv', "'chr1;chr2;chr3'", Genomic chromosomes to learn HMM parameters
     cmd = ['pureclip', '-i', ip_bam, '-bai', f'{ip_bam}.bai', '-g', f'{options.genome}/genome.fa',
-           '-iv', "'chr1;chr2;chr3'", '-nt', options.cores, '-ibam', input_bam, '-ibai', f'{input_bam}.bai',
+           '-nt', options.cores, '-ibam', input_bam, '-ibai', f'{input_bam}.bai',
            '-o', bed, '-or', bed.replace('.crosslink.sites.bed', '.binding.regions.bed'),
            '>', bed.replace('.crosslink.sites.bed', '.pureclip.log')]
     cmder.run(cmd, msg=f'Calling peaks from {bam} {size(bam)} using pureCLIP ...', pmt=True)
@@ -795,18 +792,21 @@ def calculate_entropy(bed, output, ip_read_count, input_read_count):
                'p', 'v', 'method', 'status', 'l10p', 'l2fc',
                'ensg_overlap', 'feature_type', 'feature_ensg', 'gene', 'region']
     df = pd.read_csv(bed, sep='\t', header=None, names=columns)
-    df = df[df.l2fc > 0]
-    df['pi'] = df['ip_read_number'] / ip_read_count
-    df['qi'] = df['input_read_number'] / input_read_count
+    df = df[(df.l2fc >= options.l2fc) & (df.l10p >= options.l10p)]
     if df.empty:
         logger.error(f'No valid peaks found in {bed} (l2fc > 0 failed).')
         sys.exit(1)
+    df['pi'] = df['ip_read_number'] / ip_read_count
+    df['qi'] = df['input_read_number'] / input_read_count
+    
     df['entropy'] = df.apply(lambda row: 0 if row.pi <= row.qi else row.pi * math.log2(row.pi / row.qi), axis=1)
     df['excess_reads'] = df['pi'] - df['qi']
     entropy = output.replace('.entropy.bed', '.entropy.full.bed')
     df.to_csv(entropy, index=False, columns=columns + ['entropy'], sep='\t', header=False)
-    excess_read = output.replace('.bed', 'excess.reads.tsv')
+    
+    excess_read = output.replace('.bed', '.excess.reads.tsv')
     df.to_csv(excess_read, index=False, columns=columns + ['excess_reads'], sep='\t')
+    
     df['strand'] = df.peak.str.split(':', expand=True)[2]
     df['l2fc'] = df['l2fc'].map('{:.15f}'.format)
     df['entropy'] = df['entropy'].map('{:.10f}'.format)
@@ -1039,7 +1039,111 @@ def falco(fastq, txt):
         shutil.rmtree(tmp)
 
 
-@task(inputs=[], outputs='summary.html', kind='create', parent=falco)
+def dataset_basic():
+    data = [['Data Type', 'Sample', 'Description', 'Replicate', 'Library Type', 'Barcodes']]
+    library_type = 'PE' if TYPE == 'paired' else 'SE'
+    for i, sample in enumerate(SAMPLES, 1):
+        data.append(['eCLIP', sample.ip_read.key, 'IP', i, library_type, ', '.join(sample.ip_read.barcodes)])
+        data.append(['eCLIP', sample.input_read.key, 'INPUT', i, library_type, ', '.join(sample.input_read.barcodes)])
+    data = pd.DataFrame(data[1:], columns=data[0])
+    data = data.style.hide_index()
+    return data
+
+
+def bar_plot(data, data_type, tooltips, colors):
+    samples, categories = data['Samples'], [key for key in data.keys() if key != 'Samples']
+    colors = colors[:len(categories)]
+    fig = figure(y_range=FactorRange(factors=samples[::-1]), toolbar_location=None, tooltips=tooltips,
+                 plot_height=30 * len(samples), sizing_mode="stretch_width", min_width=1000)
+    fig.add_layout(Legend(), 'right')
+    fig.hbar_stack(categories, y='Samples', height=0.8, color=colors, legend_label=categories,
+                   source=ColumnDataSource(data))
+    fig.x_range.start = 0
+    fig.x_range.range_padding = 0.1
+    formatter = NumeralTickFormatter(format="0 a") if data_type == 'counts' else NumeralTickFormatter(format="0%")
+    fig.xaxis[0].formatter = formatter
+    fig.xaxis.axis_label = 'Number of reads' if data_type == 'counts' else 'Percent of reads'
+    fig.xaxis.axis_line_color = None
+    fig.y_range.range_padding = 0.1
+    fig.yaxis.axis_line_color = None
+    fig.ygrid.grid_line_color = None
+    fig.legend.border_line_color = None
+    fig.axis.minor_tick_line_color = None
+    fig.axis.major_tick_line_color = None
+    fig.outline_line_color = None
+    return fig
+
+
+def count_percent_plot(counts, tooltips=None):
+    if tooltips:
+        count_tooltips, percent_tooltips = tooltips
+    else:
+        count_tooltips = [("Sample", "@Samples"), ("Unique Reads", "@{Unique Reads}{0.00 a}"),
+                          ("Duplicate Reads", "@{Duplicate Reads}{0.00 a}")]
+        percent_tooltips = [("Sample", "@Samples"), ("Unique Reads (%)", "@{Unique Reads}{0.00}"),
+                            ("Duplicate Reads (%)", "@{Duplicate Reads}{0.00}")]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b',
+              '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    count_figure = bar_plot(counts, 'counts', count_tooltips, colors)
+    df = pd.DataFrame(counts)
+    df = df.set_index('Samples')
+    df = df.div(df.sum(axis=1), axis=0)
+    df = df.reset_index()
+    counts = {column: df[column].tolist() for column in df.columns}
+    percent_figure = bar_plot(counts, 'percent', percent_tooltips, colors)
+    
+    count_panel = Panel(child=count_figure, title='Count')
+    percent_panel = Panel(child=percent_figure, title='Percentage')
+    
+    tabs = Tabs(tabs=[count_panel, percent_panel], sizing_mode='scale_width')
+    curdoc().add_root(tabs)
+    return tabs
+
+
+def report(counts):
+    items = {'table_dataset': dataset_basic(),
+             'figure_raw_reads': count_percent_plot(counts['raw_reads']),
+             'figure_demux': count_percent_plot(counts['demux_reads']),
+             'figure_cut1': count_percent_plot(counts['cut1']),
+             'figure_cut2': count_percent_plot(counts['cut2']),
+             'figure_repeat_map': count_percent_plot(counts['repeat_map']),
+             'figure_genome_map': count_percent_plot(counts['genome_map']),
+             'figure_dedup_reads': count_percent_plot(counts['dedup_reads']),
+             'figure_usable_reads': count_percent_plot(counts['usable_reads']),
+             'table_peak_clusters': 'table_peak_clusters',
+             'figure_peak_annotation': 'figure_peak_annotation',
+             'figure_entropy': 'figure_entropy',
+             'table_reproducibility': 'table_reproducibility'
+             }
+    # items = {'table_dataset': dataset_basic(),
+    #          'figure_raw_reads': "count_percent_plot(counts['raw_reads'])",
+    #          'figure_demux': "count_percent_plot(counts['demux_reads'])",
+    #          'figure_cut1': "count_percent_plot(counts['cut1'])",
+    #          'figure_cut2': "count_percent_plot(counts['cut2'])",
+    #          'figure_repeat_map': "count_percent_plot(counts['repeat_map'])",
+    #          'figure_genome_map': "count_percent_plot(counts['genome_map'])",
+    #          'figure_dedup_reads': "count_percent_plot(counts['dedup_reads'])",
+    #          'figure_usable_reads': "count_percent_plot(counts['usable_reads'])",
+    #          'table_peak_clusters': '2',
+    #          'figure_peak_annotation': '3',
+    #          'figure_entropy': '4',
+    #          'table_reproducibility': '5'
+    #          }
+    template = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'summary.md')
+    dp.Report(dp.Text(file=template).format(**items)).save(path=f'/storage/vannostrand/software/eclip/test/paired/qc/report.html', open=False)
+    # dp.Report("## Vaccination Report",
+    #           dp.Plot(count_percent_plot(counts['raw_reads']), caption="Vaccinations by manufacturer over time"),
+    #           dp.Plot(count_percent_plot(counts['demux_reads']), caption="Vaccinations by manufacturer over time"),
+    #           dp.Plot(count_percent_plot(counts['cut1']), caption="Vaccinations by manufacturer over time"),
+    #           dp.Plot(count_percent_plot(counts['cut2']), caption="Vaccinations by manufacturer over time"),
+    #           dp.Plot(count_percent_plot(counts['repeat_map']), caption="Vaccinations by manufacturer over time"),
+    #           dp.Plot(count_percent_plot(counts['genome_map']), caption="Vaccinations by manufacturer over time"),
+    #           dp.Plot(count_percent_plot(counts['dedup_reads']), caption="Vaccinations by manufacturer over time"),
+    #           dp.Plot(count_percent_plot(counts['usable_reads']), caption="Vaccinations by manufacturer over time"),
+    #           ).save(path=f'{QC}/report.html', open=False)
+
+
+@task(inputs=[], outputs=f'{QC}/summary.html', kind='create', parent=falco)
 def summary(inputs, outputs):
     def parse_falco_metrics(txt):
         sample, reads, duplicate = '', 0, 0.0
@@ -1090,48 +1194,48 @@ def summary(inputs, outputs):
         return os.path.basename(bam1).replace('.sort.bam', ''), int(n) - int(n2), int(n2)
 
     def get_usable_reads(bam):
-        return os.path.basename(bam1).replace('.bam', ''), int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='')[0])
+        return os.path.basename(bam).replace('.bam', ''), int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='')[0])
 
     raw_reads, demux_reads, cut1, cut2 = defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list)
     repeat_map, genome_map = defaultdict(list), defaultdict(list)
     dedup_reads, usable_reads = defaultdict(list), defaultdict(list)
     for key, read in READS.items():
         sample, unique_reads, duplicate_reads = parse_falco_metrics(f'{QC}/{key}.r1.fastq.qc.txt')
-        raw_reads['Sample'].append(sample)
+        raw_reads['Samples'].append(sample)
         raw_reads['Unique Reads'].append(unique_reads)
         raw_reads['Duplicate Reads'].append(duplicate_reads)
         barcodes = read.barcodes if read.link2 else ['umi']
         if read.link2:
             sample, unique_reads, duplicate_reads = parse_falco_metrics(f'{QC}/{key}.r2.fastq.qc.txt')
-            raw_reads['Sample'].append(sample)
+            raw_reads['Samples'].append(sample)
             raw_reads['Unique Reads'].append(unique_reads)
             raw_reads['Duplicate Reads'].append(duplicate_reads)
             for barcode in set(read.barcodes):
                 sample, unique_reads, duplicate_reads = parse_falco_metrics(f'{QC}/{key}.{barcode}.r1.fastq.qc.txt')
-                demux_reads['Sample'].append(sample)
+                demux_reads['Samples'].append(sample)
                 demux_reads['Unique Reads'].append(unique_reads)
                 demux_reads['Duplicate Reads'].append(duplicate_reads)
                 sample, unique_reads, duplicate_reads = parse_falco_metrics(f'{QC}/{key}.{barcode}.r2.fastq.qc.txt')
-                demux_reads['Sample'].append(sample)
+                demux_reads['Samples'].append(sample)
                 demux_reads['Unique Reads'].append(unique_reads)
                 demux_reads['Duplicate Reads'].append(duplicate_reads)
 
         for barcode in set(barcodes):
             cut1_metrics = f'{ECLIP}/{key}.{barcode}.trim.first.metrics'
             sample, passed_reads, failed_reads = parse_cutadapt_metrics(cut1_metrics)
-            cut1['Sample'].append(sample)
+            cut1['Samples'].append(sample)
             cut1['Passed Reads'].append(passed_reads)
             cut1['Failed Reads'].append(failed_reads)
             # shutil.move(cut1_metrics, cut1_metrics.replace(f'{ECLIP}/', f'{QC}/'))
 
             cut2_metrics = f'{ECLIP}/{key}.{barcode}.trim.second.metrics'
             sample, passed_reads, failed_reads = parse_cutadapt_metrics(cut2_metrics)
-            cut2['Sample'].append(sample)
+            cut2['Samples'].append(sample)
             cut2['Passed Reads'].append(passed_reads)
             cut2['Failed Reads'].append(failed_reads)
             # shutil.move(cut2_metrics, cut2_metrics.replace(f'{ECLIP}/', f'{QC}/'))
 
-            names = ['Sample', 'Uniquely mapped', 'Mapped to multiple loci', 'Mapped to too many loci',
+            names = ['Samples', 'Uniquely mapped', 'Mapped to multiple loci', 'Mapped to too many loci',
                      'Unmapped: too many mismatches', 'Unmapped: too short', 'Unmapped: other']
             repeat_map_log = f'{ECLIP}/repeat.elements.map/{key}.{barcode}/Log.final.out'
             counts = parse_star_log(repeat_map_log)
@@ -1147,19 +1251,21 @@ def summary(inputs, outputs):
 
             bam1, bam2 = f'{ECLIP}/{key}.{barcode}.sort.bam', f'{ECLIP}/{key}.{barcode}.sort.dedup.sort.bam'
             sample, unique_reads, duplicate_reads = get_dedup_metrics(bam1, bam2)
-            dedup_reads['Sample'].append(sample)
+            dedup_reads['Samples'].append(sample)
             dedup_reads['Unique Reads'].append(unique_reads)
             dedup_reads['Duplicate Reads'].append(duplicate_reads)
 
-            counts = get_usable_reads(f'{ECLIP}/{key}.bam')
-            usable_reads['Sample'] = counts[0]
-            usable_reads['Usable Reads'] = counts[1]
+        sample, count = get_usable_reads(f'{ECLIP}/{key}.bam')
+        usable_reads['Samples'].append(sample)
+        usable_reads['Usable Reads'].append(count)
 
     counts = {'raw_reads': raw_reads, 'demux_reads': demux_reads, 'cut1': cut1, 'cut2': cut2,
               'repeat_map': repeat_map, 'genome_map': genome_map,
               'dedup_reads': dedup_reads, 'usable_reads': usable_reads}
     with open(f'{QC}/summary.json', 'w') as o:
         json.dump(counts, o, indent=4)
+        
+    report(counts)
 
 
 def schedule():
@@ -1268,142 +1374,12 @@ def main():
         logger.debug('')
         run_time = str(datetime.timedelta(seconds=int(time.perf_counter() - START_TIME)))
         logger.trace(FOOTER.format(hh_mm_ss=f'time consumed: {run_time}'.upper().center(118)))
-        
-        
-def dataset_basic():
-    data = [['Data Type', 'Sample', 'Description', 'Replicate', 'Library Type', 'Barcodes']]
-    library_type = 'PE' if TYPE == 'paired' else 'SE'
-    for i, sample in enumerate(SAMPLES, 1):
-        data.append(['eCLIP', sample.ip_read.key, 'IP', i, library_type, ', '.join(sample.ip_read.barcodes)])
-        data.append(['eCLIP', sample.input_read.key, 'INPUT', i, library_type, ', '.join(sample.input_read.barcodes)])
-    return data
-
-
-# from bokeh.io import output_file, show
-# from bokeh.models import ColumnDataSource, FactorRange, NumeralTickFormatter, Legend
-# from bokeh.plotting import figure
-# from bokeh.models.widgets import Tabs, Panel
-#
-# import datapane as dp
-
-
-def bar_plot(data, data_type, tooltips, colors):
-    samples, categories = data['Samples'], [key for key in data.keys if key != 'Samples']
-    fig = figure(y_range=FactorRange(factors=samples[::-1]), plot_height=250, toolbar_location=None, tooltips=tooltips)
-    fig.add_layout(Legend(), 'right')
-    fig.hbar_stack(categories, y='Samples', height=0.8, color=colors, legend_label=categories,
-                   source=ColumnDataSource(data))
-    fig.x_range.start = 0
-    fig.x_range.range_padding = 0.1
-    formatter = NumeralTickFormatter(format="0 a") if data_type == 'counts' else NumeralTickFormatter(format="0,0")
-    fig.xaxis[0].formatter = formatter
-    fig.xaxis.axis_label = 'Number of reads' if data_type == 'counts' else 'Percent of reads (%)'
-    fig.xaxis.axis_line_color = None
-    fig.y_range.range_padding = 0.1
-    fig.yaxis.axis_line_color = None
-    fig.ygrid.grid_line_color = None
-    fig.legend.border_line_color = None
-    fig.axis.minor_tick_line_color = None
-    fig.axis.major_tick_line_color = None
-    fig.outline_line_color = None
-    return fig
-
-
-def count_percent_plot(counts, tooltips=None, colors=("#718dbf", "#e84d60")):
-    if tooltips:
-        count_tooltips, percent_tooltips = tooltips
-    else:
-        count_tooltips = [("Sample", "@samples"), ("Unique Reads", "@{Unique Reads}{0.00 a}"),
-                          ("Duplicate Reads", "@{Duplicate Reads}{0.00 a}")]
-        percent_tooltips = [("Sample", "@samples"), ("Unique Reads (%)", "@{Unique Reads}{0.00}"),
-                            ("Duplicate Reads (%)", "@{Duplicate Reads}{0.00}")]
-    count_figure = bar_plot(counts, 'counts', count_tooltips, colors)
-    df = pd.DataFrame(counts)
-    df = df.set_index('Samples')
-    df = df.div(df.sum(axis=1), axis=0)
-    df.reset_index()
-    counts = {column: df[column].tolist() for column in df.columns}
-    percent_figure = bar_plot(counts, 'percent', percent_tooltips, colors)
-
-    count_panel = Panel(child=count_figure, title='Count')
-    percent_panel = Panel(child=percent_figure, title='Percentage')
-
-    tabs = Tabs(tabs=[count_panel, percent_panel])
-    
-    return tabs
-    
-
-# def plot_raw_reads(counts):
-#     samples, categories, uniques, duplicates = [], ['Unique Reads', 'Duplicate Reads'], [], []
-#     unique_percents, duplicate_percents = [], []
-#     for sample, count, percent in counts:
-#         samples.append(sample)
-#         duplicate = int(count * percent / 100)
-#         duplicates.append(duplicate)
-#         uniques.append(count - duplicate)
-#         unique_percents.append(100 - percent)
-#         duplicate_percents.append(percent)
-#     counts = {'samples': samples, 'Unique Reads': uniques, 'Duplicate Reads': duplicates}
-#     percents = {'samples': samples, 'Unique Reads': unique_percents, 'Duplicate Reads': duplicate_percents}
-#
-#     # output_file("/Users/fei/Downloads/work/software/tmp/stacked_split.html")
-#
-#     tooltips = [("Sample", "@samples"), ("Unique Reads", "@{Unique Reads}{0.00 a}"),
-#                 ("Duplicate Reads", "@{Duplicate Reads}{0.00 a}")]
-#     count_fig = figure(y_range=FactorRange(factors=samples[::-1]), plot_height=250,
-#                        toolbar_location=None, tooltips=tooltips)
-#
-#     count_fig.add_layout(Legend(), 'right')
-#     count_fig.hbar_stack(categories, y='samples', height=0.8, color=["#718dbf", "#e84d60"], legend_label=categories,
-#                          source=ColumnDataSource(counts))
-#
-#     count_fig.x_range.start = 0
-#     count_fig.x_range.range_padding = 0.1
-#     count_fig.xaxis[0].formatter = NumeralTickFormatter(format="0 a")
-#     count_fig.xaxis.axis_label = 'Number of reads'
-#     count_fig.xaxis.axis_line_color = None
-#     count_fig.y_range.range_padding = 0.1
-#     count_fig.yaxis.axis_line_color = None
-#     count_fig.ygrid.grid_line_color = None
-#     count_fig.legend.border_line_color = None
-#     count_fig.axis.minor_tick_line_color = None
-#     count_fig.axis.major_tick_line_color = None
-#     count_fig.outline_line_color = None
-#
-#     tooltips = [("Sample", "@samples"), ("Unique Reads (%)", "@{Unique Reads}{0.00}"),
-#                 ("Duplicate Reads (%)", "@{Duplicate Reads}{0.00}")]
-#     percent_fig = figure(y_range=FactorRange(factors=samples[::-1]), plot_height=250, toolbar_location=None,
-#                          tooltips=tooltips)
-#     percent_fig.add_layout(Legend(), 'right')
-#     percent_fig.hbar_stack(categories, y='samples', height=0.8, color=["#718dbf", "#e84d60"],
-#                            legend_label=categories, source=ColumnDataSource(percents))
-#     percent_fig.x_range.start = 0
-#     percent_fig.x_range.range_padding = 0.1
-#     percent_fig.xaxis[0].formatter = NumeralTickFormatter(format="0,0")
-#     percent_fig.xaxis.axis_label = 'Percent of reads (%)'
-#     percent_fig.xaxis.axis_line_color = None
-#     percent_fig.y_range.range_padding = 0.1
-#     percent_fig.yaxis.axis_line_color = None
-#     percent_fig.ygrid.grid_line_color = None
-#     percent_fig.legend.border_line_color = None
-#     percent_fig.axis.minor_tick_line_color = None
-#     percent_fig.axis.major_tick_line_color = None
-#     percent_fig.outline_line_color = None
-#
-#     count_panel = Panel(child=count_fig, title='Count')
-#     percent_panel = Panel(child=percent_fig, title='Percentage')
-#
-#     tabs = Tabs(tabs=[count_panel, percent_panel])
-#
-#     # dp.Report("## Vaccination Report",
-#     #           dp.Plot(tabs, caption="Vaccinations by manufacturer over time"),
-#     #           ).save(path='/Users/fei/Downloads/work/software/tmp/report.html', open=True)
-#
-#     # show(tabs)
-#     return tabs
 
 
 if __name__ == '__main__':
     pass
-    collapse_barcode('/storage/vannostrand/analysis/20210528_Deniz/eclip/K002000195.80891.X1A.r1.fq.genome-mappedSo.bam',
-                     '/storage/vannostrand/software/eclip/test/fastd/dedup.bam')
+    # main()
+    with open('/storage/vannostrand/software/eclip/test/paired/qc/summary.json') as f:
+        counts = json.load(f)
+        report(counts)
+
