@@ -252,7 +252,7 @@ sub parse_idr_file {
 	my $stop = $tmp[2];
 	my $str = $tmp[5];
 	
-	my $idr_score = $tmp[4];
+	my $idr_score = 1000;
 	
 	my $x = int($start / $hashing_value);
 	my $y = int($stop / $hashing_value);

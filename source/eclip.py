@@ -1378,8 +1378,8 @@ def main():
 
 if __name__ == '__main__':
     pass
-    # main()
-    with open('/storage/vannostrand/software/eclip/test/paired/qc/summary.json') as f:
-        counts = json.load(f)
-        report(counts)
+    main()
+    # with open('/storage/vannostrand/software/eclip/test/paired/qc/summary.json') as f:
+    #     counts = json.load(f)
+    #     report(counts)
 
