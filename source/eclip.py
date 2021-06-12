@@ -324,8 +324,6 @@ def demux(fastq1, fastq2, basename, barcodes):
                 writer1, writer2 = writers[barcode]
                 writer1.write(r1)
                 writer2.write(r2)
-            if i > 50000:
-                break
     _ = [[v[0].close(), v[1].close()] for v in writers.values()]
     logger.info(f'Demultiplexing {fastq1} and {fastq2} with barcodes {" and ".join(barcodes)} complete.')
 
