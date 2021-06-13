@@ -903,7 +903,8 @@ def peak(ip_bams, input_bams, peak_beds, reproducible_bed):
     
         cmd = [script, ] + idr_normalized_full_beds + reproducible_full_beds
         cmd += [reproducible_bed, custom_bed] + entropy_full_beds
-        cmd += [f'{folder}/{".vs.".join(entropy_beds.keys())}.idr.out']
+        # cmd += [f'{folder}/{".vs.".join(entropy_beds.keys())}.idr.out']
+        cmd += [idr_bed]
         cmder.run(cmd, msg='Identifying reproducible peaks ...', pmt=True)
     return reproducible_bed
 
