@@ -14,11 +14,11 @@ my %idr_cutoffs = ("0.001" => "1000", "0.005" => "955", "0.01" => "830", "0.02" 
 
 my $rep1_idr_merged_full_bed = $ARGV[0];
 my $rep2_idr_merged_full_bed = $ARGV[1];
-my $rep2_idr_merged_full_bed = $ARGV[2];
+my $rep3_idr_merged_full_bed = $ARGV[2];
 
 my $rep1_full_out = $ARGV[3];
 my $rep2_full_out = $ARGV[4];
-my $rep2_full_out = $ARGV[5];
+my $rep3_full_out = $ARGV[5];
 open(REP1FULL,">$rep1_full_out") || die "Cannot open $rep1_full_out for writing!\n";
 open(REP2FULL,">$rep2_full_out") || die "Cannot open $rep2_full_out for writing!\n";
 open(REP3FULL,">$rep3_full_out") || die "Cannot open $rep3_full_out for writing!\n";
