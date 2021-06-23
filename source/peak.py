@@ -27,7 +27,7 @@ parser.add_argument('--l10p', type=float, help="Only consider peaks at or above 
 parser.add_argument('--idr', type=float, help="Only consider peaks at or above this idr score cutoff.", default=0.01)
 parser.add_argument('--dry_run', action='store_true',
                     help='Print out steps and inputs/outputs of each step without actually running the pipeline.')
-parseradd_argument('--debug', action='store_true', help='Invoke debug mode (only for develop purpose).')
+parser.add_argument('--debug', action='store_true', help='Invoke debug mode (only for develop purpose).')
 
 
 def validate_paths():
