@@ -188,20 +188,19 @@ sub parse_input_norm_full_file {
     print STDERR "Parsing $input_norm_file\n";
     open(INF,$input_norm_file) || die "Cannot open $input_norm_file for reading!\n";
     for my $line (<INF>) {
-	chomp($line);
-	my @tmp = split(/\t/,$line);
-	my $chr = $tmp[0];
-	my $start = $tmp[1];
-	my $stop = $tmp[2];
-	my ($chr2,$pos2,$str,$del) = split(/\:/,$tmp[3]);
-	$tmp[3] = $chr2.":".$pos2.":".$str;
-	my $l2fc = $tmp[11];
-	my $l10p = $tmp[10];
+        chomp($line);
+        my @tmp = split(/\t/,$line);
+        my $chr = $tmp[0];
+        my $start = $tmp[1];
+        my $stop = $tmp[2];
+        my ($chr2,$pos2,$str,$del) = split(/\:/,$tmp[3]);
+        $tmp[3] = $chr2.":".$pos2.":".$str;
+        my $l2fc = $tmp[11];
+        my $l10p = $tmp[10];
 
-	$peak_info{$chr.":".$start."-".$stop.":".$str}{$input_norm_file}{l2fc} = $l2fc;
-    $peak_info{$chr.":".$start."-".$stop.":".$str}{$input_norm_file}{l10p} = $l10p;
-	$peak_info{$chr.":".$start."-".$stop.":".$str}{$input_norm_file}{full} = join("\t",@tmp);
-
+        $peak_info{$chr.":".$start."-".$stop.":".$str}{$input_norm_file}{l2fc} = $l2fc;
+        $peak_info{$chr.":".$start."-".$stop.":".$str}{$input_norm_file}{l10p} = $l10p;
+        $peak_info{$chr.":".$start."-".$stop.":".$str}{$input_norm_file}{full} = join("\t",@tmp);
     }
     close(INF);
 
@@ -248,8 +247,6 @@ sub parse_file {
             # }
 
             for my $overlapping_idrpeak (keys %overlapping_idrs) {
-                #	    my @sorted_idr = keys %overlapping_idrs;
-                #	    my $overlapping_idrpeak = $sorted_idr[0];
                 my ($ichr,$ipos,$istr,$iidr) = split(/\:/,$overlapping_idrpeak);
 
                 if ($iidr >= $idr_cutoffs{$idr_cutoff}) {
