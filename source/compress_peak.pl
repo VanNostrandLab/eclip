@@ -12,7 +12,7 @@ my $hashing_value = 100000;
 my $bed = $ARGV[0];
 my $compressed_bed = $ARGV[1];
 my $compressed_full_bed = $compressed_bed;
-$compressed_full_bed =~ s/\.bed/.full.bed/;
+$compressed_full_bed =~ s/\.bed/.tsv/;
 open(O, ">$compressed_bed") || die "Cannot open $compressed_bed for writing!";
 open(FULL, ">$compressed_full_bed") || die "Cannot open $compressed_full_bed for writing!";
 

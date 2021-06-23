@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Pipeline for using IDR to produce a set of reproducible peaks given eClIP dataset with two or three replicates.
+Pipeline for using IDR to identify a set of reproducible peaks given eClIP dataset with two or three replicates.
 """
 
 import os
@@ -26,7 +26,8 @@ parser.add_argument('--l2fc', type=float, help="Only consider peaks at or above 
 parser.add_argument('--l10p', type=float, help="Only consider peaks at or above this l10p cutoff.", default=3)
 parser.add_argument('--idr', type=float, help="Only consider peaks at or above this idr score cutoff.", default=0.01)
 parser.add_argument('--dry_run', action='store_true',
-                    help='Print out steps and files involved in each step without actually running the pipeline.')
+                    help='Print out steps and inputs/outputs of each step without actually running the pipeline.')
+parseradd_argument('--debug', action='store_true', help='Invoke debug mode (only for develop purpose).')
 
 
 def validate_paths():
@@ -47,7 +48,7 @@ def validate_paths():
     ip_bams = files_exist(args.ip_bams, 'IP bams')
     input_bams = files_exist(args.input_bams, 'INPUT bams')
     peak_beds = files_exist(args.peak_beds, 'Peak beds')
-    outdir = args.outdir
+    outdir = args.outdir or os.getcwd()
     if os.path.exists(outdir):
         if not os.path.isdir(outdir):
             logger.error(f'Outdir "{outdir}" is a file not a directory.')
@@ -72,25 +73,10 @@ files, outdir, options = validate_paths()
 os.chdir(outdir)
 
 
-def size(file, formatting=True):
-    if os.path.isfile(file):
-        size_bytes = os.path.getsize(file)
-        if formatting:
-            if size_bytes == 0:
-                return '0B'
-            size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
-            i = int(math.floor(math.log(size_bytes, 1024)))
-            size_bytes = size_bytes / math.pow(1024, i)
-            size_bytes = f'[{size_bytes:.2f}{size_name[i]}]'
-    else:
-        size_bytes = '[?KB]' if formatting else 0
-    return size_bytes
-
-
 @task(inputs=options.ip_bams + options.input_bams, outputs=lambda i: i.replace('.bam', '.mapped.reads.count.txt'))
 def count_mapped_reads(bam, txt):
     cmd = f'samtools view -c -F 0x4 {bam} > {txt}'
-    cmder.run(cmd, msg=f'Count mapped reads in {bam} {size(bam)}...', pmt=True)
+    cmder.run(cmd, msg=f'Count mapped reads in {bam} ...', pmt=True)
 
 
 def get_mapped_reads(bam):
@@ -104,20 +90,20 @@ def normalize_peak(bed, normalized_bed):
     ip_bam, input_bam, peak_bed, _ = files[bed.replace('.peak.clusters.bed', '')]
     ip_read_count, input_read_count = get_mapped_reads(ip_bam), get_mapped_reads(input_bam)
     cmd = ['overlap_peak.pl', ip_bam, input_bam, peak_bed, ip_read_count, input_read_count, normalized_bed]
-    cmder.run(cmd, msg=f'Normalizing peaks in {peak_bed} {size(peak_bed)} ...', pmt=True)
+    cmder.run(cmd, msg=f'Normalizing peaks in {peak_bed} ...', pmt=True)
     return normalized_bed
 
 
 @task(inputs=normalize_peak, outputs=lambda i: i.replace('.bed', '.compressed.bed'))
 def compress_peak(normalized_bed, compressed_bed):
-    cmd = ['compress_peak.pl', normalized_bed.replace('.bed', '.full.bed'), compressed_bed]
+    cmd = ['compress_peak.pl', normalized_bed.replace('.bed', '.tsv'), compressed_bed]
     cmder.run(cmd, msg=f'Compressing peaks in {normalized_bed} ...', pmt=True)
     return compressed_bed
 
 
 @task(inputs=compress_peak, outputs=lambda i: i.replace('.bed', '.annotated.bed'))
 def annotate_peak(compressed_bed, annotated_bed):
-    cmd = ['annotate_peak.pl', compressed_bed.replace('.bed', '.full.bed'), annotated_bed, options.species, 'full']
+    cmd = ['annotate_peak.pl', compressed_bed.replace('.bed', '.tsv'), annotated_bed, options.species, 'full']
     cmder.run(cmd, msg=f'Annotating peaks in {compressed_bed} ...', pmt=True)
     return annotated_bed
 
@@ -138,7 +124,7 @@ def calculate_entropy(bed, output, ip_read_count, input_read_count):
 
     df['entropy'] = df.apply(lambda row: 0 if row.pi <= row.qi else row.pi * math.log2(row.pi / row.qi), axis=1)
     df['excess_reads'] = df['pi'] - df['qi']
-    entropy = output.replace('.entropy.bed', '.entropy.full.bed')
+    entropy = output.replace('.entropy.bed', '.entropy.tsv')
     df.to_csv(entropy, index=False, columns=columns + ['entropy'], sep='\t', header=False)
 
     excess_read = output.replace('.bed', '.excess.reads.tsv')
@@ -183,7 +169,7 @@ def parse_idr(out, bed):
     if len(files) == 2:
         entropy_bed1, entropy_bed2 = files[key1][3], files[key2][3]
         cmd = ['parse_idr_peaks.pl', idr_out,
-               entropy_bed1.replace('.bed', '.full.bed'), entropy_bed2.replace('.bed', '.full.bed'), idr_bed]
+               entropy_bed1.replace('.bed', '.tsv'), entropy_bed2.replace('.bed', '.tsv'), idr_bed]
         cmder.run(cmd, msg=f'Parsing IDR peaks in {idr_out} ...', pmt=True)
     else:
         idr_cutoffs = {0.001: 1000, 0.005: 955, 0.01: 830, 0.02: 705, 0.03: 632, 0.04: 580, 0.05: 540,
@@ -214,7 +200,7 @@ def intersect_idr(bed, intersected_bed):
         cmder.run(f'bedtools intersect -a {tmp_bed} -b {bed3} > {idr_intersected_bed}', msg='Intersecting IDR beds ...')
         cmder.run(f'rm {tmp_bed}')
         
-        entropy_beds = [f'{key}.peak.clusters.normalized.compressed.annotated.entropy.full.bed' for key in files]
+        entropy_beds = [f'{key}.peak.clusters.normalized.compressed.annotated.entropy.tsv' for key in files]
         cmd = ['parse_idr_peaks_3.pl', idr_intersected_bed] + entropy_beds + [f'{idr_bed}']
         cmder.run(cmd, msg=f'Parsing intersected IDR peaks in {idr_bed} ...', pmt=True)
 
@@ -238,13 +224,13 @@ def reproducible_peak(inputs, reproducible_bed):
     idr_normalized_full_beds, entropy_full_beds, reproducible_txts = [], [], []
     for ip_bam, input_bam, peak_bed in zip(options.ip_bams, options.input_bams, options.peak_beds):
         name = os.path.basename(peak_bed.replace('.peak.clusters.bed', ''))
-        idr_normalized_full_beds.append(f'{name}.idr.normalized.full.bed')
-        entropy_full_beds.append(f'{name}.peak.clusters.normalized.compressed.annotated.entropy.full.bed')
+        idr_normalized_full_beds.append(f'{name}.idr.normalized.tsv')
+        entropy_full_beds.append(f'{name}.peak.clusters.normalized.compressed.annotated.entropy.tsv')
         reproducible_txts.append(f'{name}.reproducible.peaks.tsv')
 
     cmd = [script] + idr_normalized_full_beds + reproducible_txts
     cmd += [reproducible_bed, custom] + entropy_full_beds
-    cmd += [f'{".vs.".join(files.keys())}.idr.out.bed']
+    cmd += [f'{".vs.".join(files.keys())}.idr.out{".bed" if len(files) == 3 else ""}']
     cmder.run(cmd, msg='Identifying reproducible peaks ...', pmt=True)
 
     

@@ -42,7 +42,7 @@ my %peak_read_counts;
 &read_bam($input_bam,"input");
 
 my $output_full = $output;
-$output_full =~ s/\.bed/.full.bed/;
+$output_full =~ s/\.bed/.tsv/;
 open(OUT,">$output");
 open(OUTFULL,">$output_full");
 
