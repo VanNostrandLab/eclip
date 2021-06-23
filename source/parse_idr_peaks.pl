@@ -60,7 +60,8 @@ sub parse_file {
         my $l2fc = $fields[11];
         my $l10p = $fields[10];
 
-        next unless ($l2fc >= $l2fc_cutoff && $l10p >= $l10p_cutoff);
+        # Added l2fc > 0 in the 3-way IDR parse
+        next unless ($l2fc > 0 && $l2fc >= $l2fc_cutoff && $l10p >= $l10p_cutoff);
         my $x = int($start / $hashing_value);
         my $y = int($stop / $hashing_value);
 
@@ -74,7 +75,14 @@ sub parse_file {
                 $overlapping_idrs{$idr_peak} = $idr_score;
             }
         }
-	
+
+        # New lines in the 3-way IDR parse
+        next unless (scalar(keys %overlapping_idrs) > 0);
+
+        # my @sorted_idr = sort {$overlapping_idrs{$b} <=> $overlapping_idrs{$a}} keys %overlapping_idrs;
+        # my $overlapping_idrpeak = $sorted_idr[0];
+        # my ($ichr,$ipos,$istr,$iidr) = split(/\:/,$overlapping_idrpeak);
+
         if (scalar(keys %overlapping_idrs) > 0) {
             if (scalar(keys %overlapping_idrs) > 1) {
                 print STDERR "ERROR: peak overlaps with more than one IDR region $line\n".join("\t", keys
