@@ -147,8 +147,8 @@ IFS=, read -r input_fastq1 input_fastq2 <<< "${input_fastq}"
 IFS=, read -r output_fastq1 output_fastq2 <<< "${output_fastq}"
 IFS=, read -r output_metric1 output_metric2 <<< "${output_metric}"
 
-temp_fastq1=$(mktemp "${input_fastq1}".XXXXXX.fastq.gz)
-temp_fastq2=$(mktemp "${input_fastq2}".XXXXXX.fastq.gz)
+temp_fastq1=$(mktemp "${output_fastq1}".XXXXXXXXXX.fastq.gz)
+temp_fastq2=$(mktemp "${output_fastq2}".XXXXXXXXXX.fastq.gz)
 trap 'rm -f ${temp_fastq1} ${temp_fastq2}' EXIT
 
 if [[ "${input_fastq2}" == "" ]]
