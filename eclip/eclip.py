@@ -162,8 +162,7 @@ def extract_umi(fastq, umi):
            '--random-seed', 1,
            '--stdin', fastq,
            '--bc-pattern', 'NNNNNNNNNN',
-           '--log', fastq.replace('.fastq.gz', '.umi.metrics'),
-           '--stdout', umi]
+           '--stdout', umi, '>', '/dev/null']
     cmder.run(cmd, msg=message, pmt=True)
 
 
@@ -269,15 +268,20 @@ def map_to_reference_genome(mate, bam):
         cmder.run(f'mv {prefix}/Log.final.out {bam.replace(".genome.map.bam", ".genome.map.log")}')
         unmap = bam.replace('.genome.map.bam', '.genome.unmap.fastq.gz')
         cmder.run(f'pigz -c -p {options.cpus} {prefix}/Unmapped.out.mate1 > {unmap}')
-        cmder.run(f'samtools sort -@ {options.cpus} -m 2G -o {bam} {prefix}/Aligned.out.bam',
-                  msg=f'Sorting {prefix}/Aligned.out.bam to {bam} ...')
-        cmder.run(f'samtools index {bam}', msg=f'Indexing {bam} ...')
+        cmder.run(f'mv {prefix}/Aligned.out.bam {bam}')
     finally:
         shutil.rmtree(prefix)
     return bam
 
 
-@task(inputs=map_to_reference_genome, outputs=lambda i: i.replace('.genome.map.bam', '.bam'))
+@task(inputs=map_to_reference_genome, outputs=lambda i: i.replace('.genome.map.bam', '.genome.map.sort.bam'))
+def sort_index_bam(bam, out):
+    cmder.run(f'samtools sort -@ {options.cpus} -m 2G -o {out} {bam}',
+              msg=f'Sorting {bam} to {out} ...')
+    cmder.run(f'samtools index {out}', msg=f'Indexing {out} ...')
+
+
+@task(inputs=sort_index_bam, outputs=lambda i: i.replace('.genome.map.sort.bam', '.bam'))
 def dedup_bam(bam, out):
     """Deduplicate SE BAM using umi_tools dedup."""
     cmd = ['umi_tools', 'dedup', '--random-seed', 1, '--stdin', bam, '--method', 'unique', '--stdout', out]
@@ -456,48 +460,8 @@ def count_lines(file):
 
 @task(inputs=[], outputs=['rescue.ratio.txt'], parent=clipper, mkdir=['rescue'])
 def rescue_ratio(inputs, outputs):
-    def prepare_pseudo_bam(bam1, bam2, basename):
-        if os.path.exists(bam1) and os.path.exists(bam2):
-            logger.info('Split BAM files already exist.')
-        else:
-            pseudo_bam = f'{basename}.bam'
-            tmp_pseudo_bam = pseudo_bam.replace('.bam', '.tmp.bam')
-            cmd = f'samtools merge {tmp_pseudo_bam} {bam1} {bam2}'
-            cmder.run(cmd, msg=f'Merging {bam1} and {bam2} ...')
-            
-            cmder.run(f'samtools sort -@ {options.cpus} -m 2G -o {pseudo_bam} {tmp_pseudo_bam}')
-            cmder.run(f'rm {tmp_pseudo_bam}')
-            
-            bam1, bam2 = split_bam(pseudo_bam, f'{basename}.pseudo.01.bam', f'{basename}.pseudo.02.bam')
-        return bam1, bam2
-    
-    if len(SAMPLES) == 1:
-        return
-    pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds = [], [], []
-    for i, (sample1, sample2) in enumerate(itertools.combinations(SAMPLES, 2), start=1):
-        pseudo_ip_bam = prepare_pseudo_bam(sample1.ip_bam, sample2.ip_bam, f'rescue/{sample1.name}.{sample2.name}.ip')
-        pseudo_ip_bams.extend(pseudo_ip_bam)
-        
-        pseudo_input_bam = prepare_pseudo_bam(sample1.input_bam, sample2.input_bam,
-                                              f'rescue/{sample1.name}.{sample2.name}.input')
-        pseudo_input_bams.extend(pseudo_input_bam)
-        
-        pseudo_peak_beds.extend([clipper_peaks(bam) for bam in pseudo_ip_bam])
-    
-    key = ".".join([sample.name for sample in SAMPLES])
-    pseudo_reproducible_bed = f'rescue/{key}.ip.pseudo.01.vs.{key}.ip.pseudo.02.reproducible.peaks.bed'
-    if not os.path.exists(pseudo_reproducible_bed):
-        peak(pseudo_ip_bams, pseudo_input_bams, pseudo_peak_beds, pseudo_reproducible_bed, 'rescue', cwd=options.outdir)
-    pseudo_count = count_lines(pseudo_reproducible_bed)
-    
-    count = count_lines(f'{".vs.".join([sample.name for sample in SAMPLES])}.reproducible.peaks.bed')
-    try:
-        ratio = max(count, pseudo_count) / min(count, pseudo_count)
-    except ZeroDivisionError:
-        ratio = 0
-        logger.error(f'No peaks found in reproducible peaks or pseudo reproducible peaks, return ratio 0.')
-    with open(outputs, 'w') as o:
-        o.write(f'{ratio}\n')
+    cmd = ['eclip_rescue', '--names', ' '.join(options.names), '--wd', options.outdir, '--dry_run']
+    cmder.run(cmd, stdout=sys.stdout, stderr=sys.stderr)
 
 
 @task(inputs=[], outputs=['consistency.ratio.txt'], parent=clipper, mkdir=['consistency'])
