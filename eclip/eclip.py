@@ -234,7 +234,7 @@ def map_to_repeat_elements(fastq, mate):
         message = f'Map SE reads in {fastq} to repeat elements ...'
         cmder.run(cmd, msg=message)
         cmder.run(f'mv {prefix}/Log.final.out {mate.replace(".repeat.unmap.fastq.gz", ".repeat.map.log")}')
-        cmder.run(f'mv {prefix}/Aligned.out.bam {mate.replace(".repeat.unmap.fastq.gz", ".repeat.map.bam")}')
+        # cmder.run(f'mv {prefix}/Aligned.out.bam {mate.replace(".repeat.unmap.fastq.gz", ".repeat.map.bam")}')
         cmder.run(f'pigz -c -p {options.cpus} {prefix}/Unmapped.out.mate1 > {mate}')
     finally:
         shutil.rmtree(prefix)
@@ -298,7 +298,7 @@ def dedup_bam(bam, out):
 def repetitive_elements_map(bam, tsv):
     cmd = ['repeat-maps', '--fastq', bam.replace('.genome.map.sort.bam', '.trim.fastq.gz'),
            '--bam', bam, '--dataset', bam.replace('.genome.map.sort.bam', ''), '--scheduler', 'local',
-           '--cpus', options.cpus, '--species', options.species, '--outdir', options.outdir, '--debug']
+           '--cpus', options.cpus, '--species', options.species, '--outdir', options.outdir]
     cmder.run(cmd, msg=f'Mapping {bam.replace(".genome.map.sort.bam", "")} repetitive elements ...')
 
 
@@ -490,13 +490,10 @@ def motif_analysis(bed, output):
         </div>
         """
         lis, divs, table_ids = [], [], []
-        # for i, html in enumerate(glob.iglob(f'{name}.motifs.*/*.homer.results.html')):
-        # print(glob.glob(f'{name}.motif*/*.html'))
         folder = f'{name}.motifs.40.min.plus.5p.20.3p.5'
         for i, html in enumerate(glob.iglob(f'{folder}/*.html')):
             region = html.split('.')[-4]
             rid = 'region_' + region
-            # print(f'Parsing motifs in {region} ...')
             text = parse_motif_html(html)
             if region == 'all':
                 lis.append(li.format(tid=rid, active=' active', name=region))
@@ -508,7 +505,8 @@ def motif_analysis(bed, output):
         template = '/storage/vannostrand/software/eclip/data/motif.template.html'
         with open(template) as f, open(output, 'w') as o:
             o.write(f.read().format(title=f'Motifs found in {name}', content=text))
-        cmder.run(f'zip {folder} -r {folder}/*')
+        cmder.run(f'zip -r -q {folder}.zip {folder}/*')
+        cmder.run(f'rm -rf {folder}')
             
     basename = output.split('.motifs.')[0]
     cmd = ['motif', bed, options.species, options.outdir, basename, options.l10p, options.l2fc, options.cpus]
@@ -618,18 +616,6 @@ def consistency_ratio(inputs, txt):
         logger.error(f'No peaks found in one of the split reproducible peaks, return ratio 0.')
     with open(txt, 'w') as o:
         o.write(f'{ratio}\n')
-        
-        
-def find_motif():
-    extension = '.ip.peak.clusters.normalized.compressed.annotated.bed'
-    for bed in glob.iglob(f'*{extension}'):
-        exe = '/storage/vannostrand/software/motif/motif'
-        name = bed.replace(extension, '')
-        if len(glob.glob(f'{name}.motifs.*/*.homer.results.html')) >= 12:
-            logger.info(f'Motifs already identified for {bed}.')
-        else:
-            cmd = [exe, bed, options.species, options.outdir, name, options.l10p, options.l2fc, options.cpus]
-            cmder.run(cmd, msg=f'Finding motifs in {bed} ...')
 
 
 def parse_cutadapt_metrics(metrics):
@@ -854,6 +840,23 @@ def report(txt, out):
             }
     with open(template) as f, open(out, 'w') as o:
         o.write(f.read().format(**data))
+        
+      
+@task(inputs=[], outputs=['.log.metrics.zip'], parent=report)
+def cleanup(inputs, output):
+    cmder.run('rm *.umi.fastq.gz *.trim.fastq.gz *.unmap.fastq.gz || true')
+    fastq_links = [p for p in glob.iglob("*.fastq.gz") if os.path.islink(p)]
+    if fastq_links:
+        cmder.run(f'rm {" ".join(fastq_links)}')
+    cmder.run('rm *.repeat.map.bam *.genome.map.bam* *.genome.map.sort.bam* || true ')
+    cmder.run('rm *.mapped.reads.count.txt || true')
+    bam_links = [p for p in glob.iglob("*.bam") if os.path.islink(p)]
+    if bam_links:
+        cmder.run(f'rm {" ".join(bam_links)}')
+    cmder.run('rm *.normalized.bed *.normalized.tsv')
+    cmder.run('rm *.compressed.bed *.compressed.tsv')
+    cmder.run(f'zip {output} *.log *.metrics')
+    cmder.run('rm *.log *.metrics || true')
 
 
 def schedule():
