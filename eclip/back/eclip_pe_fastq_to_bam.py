@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-A pipeline for processing SE eCLIP fastq files and map them to both repeat elements and reference genome.
+A pipeline for processing PE eCLIP fastq files and map them to both repeat elements and reference genome.
 """
 
 import argparse
@@ -41,10 +41,12 @@ def basename(path, exts=None):
 
 parser = argparse.ArgumentParser(description=__doc__, prog='eclip_se_fastq_to_bam')
 parser.add_argument('--fastq', required=True, nargs='+', help='Path to FASTQ file(s).', type=file_path)
-parser.add_argument('--adapters_fasta', nargs='+', required=True, type=file_path,
-                    help="Path to the fasta file contains adapters and their sequences (for single-end dataset only.")
-parser.add_argument('--name', nargs='+', help='Path to a UMI extracted FASTQ file.', type=file_path)
-parser.add_argument('--outdir', help='Path to the output BAM file (must ends with .bam).')
+parser.add_argument('--barcodes', required=True, nargs='+', help='Path to FASTQ file(s).', type=file_path)
+parser.add_argument('--barcodes_fasta',
+                    help="Path to the fasta file contains barcode sequences.")
+parser.add_argument('--randomer_length', help="Length of randomer, default: 10.", default=10)
+parser.add_argument('--name', nargs='+', help='Name of each sample.', type=file_path)
+parser.add_argument('--outdir', help='Path to a directory for saving outputs.')
 parser.add_argument('--genome', required=True, help="Path to STAR reference genome index directory.", type=dir_path)
 parser.add_argument('--genome_label', help="A short label for reference genome, e.g., hg19, mm10, default: genome.",
                     default='genome')
