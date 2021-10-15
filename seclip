@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+source /storage/vannostrand/software/eclip/venv/environment.sh
+export PATH=/storage/vannostrand/software/repeat-maps:$PATH
+export PATH=/storage/vannostrand/software/motif:$PATH
+
+if [[ "$*" == *--debug* ]]; then
+    /storage/vannostrand/software/eclip/scripts/seclip "$@"
+else
+    /storage/vannostrand/software/eclip/venv/bin/seclip "$@"
+fi
+

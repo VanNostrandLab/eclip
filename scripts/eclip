@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+source /storage/vannostrand/software/eclip/venv/environment.sh
+python /storage/vannostrand/software/eclip/eclip/eclip.py $@

@@ -12,7 +12,6 @@ import gzip
 import sys
 import time
 import subprocess
-
 import datetime
 import tempfile
 import shutil
@@ -21,7 +20,12 @@ import math
 
 import pysam
 import cmder
+import pandas as pd
 from seqflow import Flow, task, logger
+from bokeh.models import ColumnDataSource, FactorRange, NumeralTickFormatter, Legend
+from bokeh.plotting import figure
+from bokeh.models.widgets import Tabs, Panel
+from bokeh.embed import components
 
 
 def file_path(p):
@@ -60,9 +64,9 @@ parser.add_argument('--l10p', type=int, help="Only consider peaks at or above th
 
 parser.add_argument('--job', help="Name of your job", default='eCLIP')
 parser.add_argument('--email', help='Email address for notifying you the start, end, and abort of you job.')
-parser.add_argument('--time', type=int, help='Time (in integer hours) for running your job.', default=36)
+parser.add_argument('--time', type=int, help='Time (in integer hours) for running your job.', default=48)
 parser.add_argument('--memory', type=int, help='Amount of memory (in GB) for all CPU cores.', default=32)
-parser.add_argument('--cpus', type=int, help='Maximum number of CPU cores can be used for your job.', default=16)
+parser.add_argument('--cpus', type=int, help='Maximum number of CPU cores can be used for your job.', default=32)
 parser.add_argument('--scheduler', choices=('pbs', 'qsub', 'slurm', 'sbatch', 'local'), default='slurm',
                     help='Name (case insensitive) of the scheduler on your cluster.')
 parser.add_argument('--hold_submit', action='store_true',
@@ -120,8 +124,8 @@ class Sample:
         self.input_fastq = f'{sample_name}.input.fastq.gz'
         self.ip_bam = f'{sample_name}.ip.bam'
         self.input_bam = f'{sample_name}.input.bam'
-        self.peak_bed = f'{sample_name}.peak.clusters.bed'
-        self.cross_bed = f'{sample_name}.crosslink.sites.bed'
+        self.peak_bed = f'{sample_name}.ip.peak.clusters.bed'
+        self.cross_bed = f'{sample_name}.ip.crosslink.sites.bed'
         
         
 FASTQS, SAMPLES = {}, []
@@ -287,6 +291,15 @@ def dedup_bam(bam, out):
     cmd = ['umi_tools', 'dedup', '--random-seed', 1, '--stdin', bam, '--method', 'unique', '--stdout', out]
     cmder.run(cmd, msg=f'Deduplicating {bam} by umi_tools dedup ...')
     cmder.run(f'samtools index {out}', msg=f'Indexing {bam} ...')
+    
+    
+@task(inputs=sort_index_bam,
+      outputs=lambda i: i.replace('.genome.map.sort.bam', 'repetitive.elements.combine.with.unique.map.tsv.gz'))
+def repetitive_elements_map(bam, tsv):
+    cmd = ['repeat-maps', '--fastq', bam.replace('.genome.map.sort.bam', '.trim.fastq.gz'),
+           '--bam', bam, '--dataset', bam.replace('.genome.map.sort.bam', ''), '--scheduler', 'local',
+           '--cpus', options.cpus, '--species', options.species, '--outdir', options.outdir]
+    cmder.run(cmd, msg=f'Mapping {bam.replace(".genome.map.sort.bam", "")} repetitive elements ...')
 
 
 @task(inputs=dedup_bam, cpus=options.cpus, outputs=lambda i: i.replace('.bam', '.plus.bw'))
@@ -316,7 +329,7 @@ def make_bigwig_files(bam, bigwig):
     return bigwig
 
 
-@task(inputs=[], outputs=['hub.txt'], parent=make_bigwig_files)
+@task(inputs=[], outputs=[f'{options.dataset}.hub.txt'], parent=make_bigwig_files)
 def make_hub_file(inputs, output):
     logger.info('Make hub track file ...')
     header = f"""hub {options.track.replace(' ', '_')}
@@ -375,7 +388,7 @@ container multiWig
 
 
 def clipper_peaks(bam, bed=''):
-    bed = bed if bed else bam.replace('.ip.bam', '.peak.clusters.bed')
+    bed = bed if bed else bam.replace('.bam', '.peak.clusters.bed')
     if os.path.isfile(bed):
         logger.info(f'Clipper bed {bed} already exists.')
     else:
@@ -386,7 +399,7 @@ def clipper_peaks(bam, bed=''):
 
 @task(inputs=[], outputs=[sample.peak_bed for sample in SAMPLES], parent=dedup_bam)
 def clipper(bam, bed):
-    bam = bed.replace('.peak.clusters.bed', '.ip.bam')
+    bam = bed.replace('.peak.clusters.bed', '.bam')
     return clipper_peaks(bam, bed)
 
 
@@ -395,28 +408,32 @@ def clipper(bam, bed):
 def pureclip(bam, bed):
     ip_bam, input_bam = [[sample.ip_bam, sample.input_bam] for sample in SAMPLES
                          if sample.cross_bed == bed][0]
+    header = cmder.run(f'samtools view -H {ip_bam}').stdout.read()
+    refs = [line.split()[1].replace('SN:', '') for line in header.splitlines() if line.startswith('@SQ')][:3]
+    refs = ';'.join(refs)
     cmd = ['pureclip', '-i', ip_bam, '-bai', f'{ip_bam}.bai', '-g', f'{options.genome}/genome.fa',
-           '-nt', options.cpus, '-ibam', input_bam, '-ibai', f'{input_bam}.bai',
+           '-nt', options.cpus, '-ibam', input_bam, '-ibai', f'{input_bam}.bai', '-iv', f'"{refs};"',
            '-o', bed, '-or', bed.replace('.crosslink.sites.bed', '.binding.regions.bed'),
            '>', bed.replace('.crosslink.sites.bed', '.pureclip.log')]
-    cmder.run(cmd, msg=f'Calling peaks from {bam} using pureCLIP ...')
+    cmder.run(cmd, msg=f'Calling peaks from {ip_bam} and {input_bam} using pureCLIP ...')
 
 
-def peak(ip_bams, input_bams, peak_beds, ids, reproducible_bed, outdir, cwd=''):
+def peak(ip_bams, input_bams, peak_beds, reproducible_bed, outdir):
     cmd = ['peak', '--ip_bams', ' '.join(ip_bams),
            '--input_bam', ' '.join(input_bams),
            '--peak_beds', ' '.join(peak_beds),
-           '--ids', ' '.join(ids),
            '--read_type', 'SE',
            '--species', 'hg19' if options.species in ('hg19', 'hg19chr19') else options.species,
            '--outdir', outdir, '--cores', options.cpus,
            '--l2fc', options.l2fc, '--l10p', options.l10p]
-    cwd = cwd if cwd else os.path.dirname(reproducible_bed)
-    cmder.run(cmd, cwd=cwd, stdout=sys.stdout, stderr=sys.stderr)
+    cmder.run(cmd, cwd=options.outdir, stdout=sys.stdout, stderr=sys.stderr)
     return reproducible_bed
 
 
-@task(inputs=[], outputs=[f'{".vs.".join([s.name for s in SAMPLES])}.reproducible.peaks.bed'], parent=clipper)
+@task(inputs=[],
+      outputs=[f'{".vs.".join([f"{s.name}.ip" for s in SAMPLES])}.annotated.reproducible.peaks.bed'
+               if len(SAMPLES) >= 2 else f'{SAMPLES[0].name}.ip.peak.clusters.normalized.compressed.annotated.bed'],
+      parent=clipper)
 def reproducible_peaks(inputs, outputs):
     ip_bams, input_bams, peak_beds, ids = [], [], [], []
     for sample in SAMPLES:
@@ -424,32 +441,109 @@ def reproducible_peaks(inputs, outputs):
         input_bams.append(sample.input_bam)
         peak_beds.append(sample.peak_bed)
         ids.append(sample.name)
-    peak(ip_bams, input_bams, peak_beds, ids, outputs, options.outdir, cwd=options.outdir)
+    peak(ip_bams, input_bams, peak_beds, outputs, options.outdir)
+    
+    
+@task(inputs=reproducible_peaks,
+      outputs=lambda i: i.split('.annotated.reproducible.')[0] + '.motifs.40.min.plus.5p.20.3p.5.html'
+      if '.annotated.reproducible.' in i
+      else i.split('.ip.peak.clusters.')[0] + '.motifs.40.min.plus.5p.20.3p.5.html')
+def motif_analysis(bed, output):
+    def parse_motif_html(html):
+        lines = []
+        with open(html) as f:
+            for line in f:
+                if line.startswith('Total target sequences'):
+                    lines.append(line)
+                elif line.startswith('Total background sequences'):
+                    lines.append(line)
+                    break
+            for line in f:
+                if line.startswith('</TABLE>'):
+                    lines.append(line)
+                    break
+                else:
+                    if '<BR/><A target=' in line:
+                        line = line.split('<BR/><A target=')[0] + '</TD></TR>\n'
+                    lines.append(line)
+        text = ''.join(lines).replace('<TD>Motif File</TD></TR>', '</TR>')
+        text = text.replace('border="1" cellpading="0" cellspacing="0"', f'class="text-center motif"')
+        text = text.replace('possible false positive</FONT><BR/>', 'possible false positive</FONT><BR/><BR/>')
+        text = text.replace('<TR><TD>Rank</TD>', '<thead><TR><TD>Rank</TD>')
+        text = text.replace('STD(Bg STD)', 'STD (Bg STD)')
+        text = text.replace('<TD>Best Match/Details</TD></TR>', '<TD>Best Match/Details</TD></TR></thead>')
+        return text
+
+    def compile_motif_html(name, output):
+        ul = """<ul class="nav nav-pills" id="MotifTab" role="tablist">
+        {lis}
+        </ul>
+        """
+        li = """<li class="nav-item mx-1 my-1" role="presentation">
+        <button class="nav-link border border-primary py-1{active}" id="{tid}-tab" data-bs-toggle="pill"
+        data-bs-target="#{tid}"
+        type="button" role="tab">{name}</button>
+        </li>
+        """
+        div = """<div class="tab-content" id="MotifTabContent">
+        {divs}
+        </div>
+        """
+        lis, divs, table_ids = [], [], []
+        # for i, html in enumerate(glob.iglob(f'{name}.motifs.*/*.homer.results.html')):
+        # print(glob.glob(f'{name}.motif*/*.html'))
+        for i, html in enumerate(glob.iglob(f'{name}.motif*/*.html')):
+            region = html.split('.')[-4]
+            rid = 'region_' + region
+            # print(f'Parsing motifs in {region} ...')
+            text = parse_motif_html(html)
+            if region == 'all':
+                lis.append(li.format(tid=rid, active=' active', name=region))
+                divs.append(f'<div class="py-3 tab-pane fade show active" id="{rid}" role="tabpanel">{text}</div>')
+            else:
+                lis.append(li.format(tid=rid, active='', name=region))
+                divs.append(f'<div class="py-5 tab-pane fade" id="{rid}" role="tabpanel">{text}</div>')
+        text = ul.format(lis='\n'.join(lis)) + '\n' + div.format(divs='\n'.join(divs))
+        template = '/storage/vannostrand/software/eclip/data/motif.template.html'
+        with open(template) as f, open(output, 'w') as o:
+            o.write(f.read().format(title=f'Motifs found in {name}', content=text))
+            
+    basename = output.split('.motifs.')[0]
+    cmd = ['motif', bed, options.species, options.outdir, basename, options.l10p, options.l2fc, options.cpus]
+    cmder.run(cmd, msg=f'Finding motifs in {bed} ...')
+    logger.info(f'Parsing and compiling motifs for {basename} ...')
+    compile_motif_html(basename, output)
+    logger.info(f'Parsing and compiling motifs for {basename} complete.')
+    
+
+def merge_bam(bams, bam):
+    if os.path.isfile(bam):
+        logger.info(f'BAM file {bam} already exist.')
+    else:
+        cmd = f'samtools merge {bam} {" ".join(bams)}'
+        cmder.run(cmd, msg=f'Merging {" ".join(bams)} to {bam} ...')
+    return bam
 
 
-def split_bam(bam, bam1, bam2):
+def split_bam(bam, basename, n):
     def count_mapped_reads(bam):
         count = int(cmder.run(f'samtools view -c -F 0x4 {bam}', msg='').stdout.read())
         logger.info(f'Found {count:,} mapped reads in {bam}.')
         return count
-    
-    if os.path.isfile(bam1) and os.path.isfile(bam2):
-        logger.info(f'BAMs {bam1} and {bam2} already exist.')
+
+    bams = [f'{basename}{i}.bam' for i in range(n)]
+    if all([os.path.isfile(b) for b in bams]):
+        logger.info(f'Split bams already exist.')
     else:
-        half_lines = int(count_mapped_reads(bam) / 2) + 1
-        cmd = f'samtools view {bam} | shuf | split -d -l {half_lines} - {bam}'
+        lines = int(count_mapped_reads(bam) / n) + 1
+        cmd = f'samtools view {bam} | shuf | split - -a 1 --additional-suffix=.bam -d -l {lines} {basename}'
         cmder.run(cmd, msg=f'Shuffling and splitting {bam} ...')
-        tmp_bam1, tmp_bam2 = bam1.replace('.bam', '.tmp.bam'), bam2.replace('.bam', '.tmp.bam')
-        cmd = f'samtools view -H {bam} | cat - {bam}00 | samtools view -bS - > {tmp_bam1}'
-        
-        cmder.run(cmd, msg=f'Creating headers for {bam1} ...')
-        cmder.run(f'samtools sort -@ {options.cpus} -o {bam1} {tmp_bam1}')
-        cmd = f'samtools view -H {bam} | cat - {bam}01 | samtools view -bS - > {tmp_bam2}'
-        
-        cmder.run(cmd, msg=f'Creating headers for {bam2} ...')
-        cmder.run(f'samtools sort -@ {options.cpus} -o {bam2} {tmp_bam2}')
-        cmder.run(f'rm {bam}00 {bam}01 {tmp_bam1} {tmp_bam2}')
-    return bam1, bam2
+        for b in bams:
+            tmp = b.replace(".bam", ".tmp.bam")
+            cmder.run(f'samtools view -H {bam} | cat - {b} | samtools view -bS - > {tmp}')
+            cmder.run(f'samtools sort -@ {options.cpus} -o {b} {tmp}')
+            cmder.run(f'rm {tmp}')
+    return bams
 
 
 def count_lines(file):
@@ -458,38 +552,306 @@ def count_lines(file):
     return lines
 
 
-@task(inputs=[], outputs=['rescue.ratio.txt'], parent=clipper, mkdir=['rescue'])
-def rescue_ratio(inputs, outputs):
-    cmd = ['eclip_rescue', '--names', ' '.join(options.names), '--wd', options.outdir, '--dry_run']
-    cmder.run(cmd, stdout=sys.stdout, stderr=sys.stderr)
-
-
-@task(inputs=[], outputs=['consistency.ratio.txt'], parent=clipper, mkdir=['consistency'])
-def consistency_ratio(inputs, outputs):
+@task(inputs=[], outputs=[f'{options.dataset}.rescue.ratio.txt'], parent=reproducible_peaks, mkdir=['rescue'])
+def rescue_ratio(inputs, txt):
     if len(SAMPLES) == 1:
-        return
-    counts = []
-    for i, sample in enumerate(SAMPLES, start=1):
-        split_ip_bams = split_bam(sample.ip_bam,
-                                  f'consistency/{sample.name}.ip.split.01.bam',
-                                  f'consistency/{sample.name}.ip.split.02.bam')
-        split_input_bams = split_bam(sample.input_bam,
-                                     f'consistency/{sample.name}.input.split.01.bam',
-                                     f'consistency/{sample.name}.input.split.02.bam')
-        split_peak_beds = [clipper_peaks(split_ip_bams[0]), clipper_peaks(split_ip_bams[1])]
-        
-        bed = f'consistency/{sample.name}.ip.split.01.vs.{sample.name}.ip.split.02.reproducible.peaks.bed'
-        if not os.path.exists(bed):
-            peak(split_ip_bams, split_input_bams, split_peak_beds, bed,  'consistency', cwd=options.outdir)
-        counts.append(count_lines(bed))
+        logger.warning('No enough samples (n = 1 < 2) to calculate rescue ratio!')
+        shutil.rmtree('rescue')
+        return ''
+    ip_bams, input_bams = [s.ip_bam for s in SAMPLES], [s.input_bam for s in SAMPLES]
+    ip_pseudo_bam = merge_bam(ip_bams, os.path.join('rescue', 'ip.pseudo.bam'))
+    ip_pseudo_bams = split_bam(ip_pseudo_bam, os.path.join('rescue', 'ip.pseudo.'), len(ip_bams))
+    os.unlink(ip_pseudo_bam)
     
+    input_pseudo_bam = merge_bam(input_bams, os.path.join('rescue', 'input.pseudo.bam'))
+    input_pseudo_bams = split_bam(input_pseudo_bam, os.path.join('rescue', 'input.pseudo.'), len(input_bams))
+    os.unlink(input_pseudo_bam)
+    
+    pseudo_peak_beds = [clipper_peaks(bam, bam.replace('.bam', '.peak.clusters.bed')) for bam in ip_pseudo_bams]
+    basename = ".vs.".join([os.path.basename(bam).replace('.bam', '') for bam in ip_pseudo_bams])
+    pseudo_peak_bed = os.path.join('rescue', f'{basename}.reproducible.peaks.bed')
+    peak(ip_pseudo_bams, input_pseudo_bams, pseudo_peak_beds, pseudo_peak_bed, 'rescue')
+
+    pseudo_count = count_lines(pseudo_peak_bed)
+    basename = ".vs.".join([f'{name}.ip' for name in options.names])
+    actual_count = count_lines(f'{basename}.reproducible.peaks.bed')
     try:
-        ratio = counts[0] / counts[1]
+        ratio = max(actual_count, pseudo_count) / min(actual_count, pseudo_count)
+    except ZeroDivisionError:
+        ratio = 0
+        logger.error(f'No peaks found in reproducible peaks or pseudo reproducible peaks, return ratio 0.')
+    with open(txt, 'w') as o:
+        o.write(f'{ratio}\n')
+    
+
+@task(inputs=[], outputs=[f'{options.dataset}.consistency.ratio.txt'], parent=reproducible_peaks, mkdir=['consistency'])
+def consistency_ratio(inputs, txt):
+    if len(SAMPLES) == 1:
+        logger.warning('No enough samples (n = 1 < 2) to calculate self-consistency ratio!')
+        shutil.rmtree('consistency')
+        return ''
+    ip_bam1, ip_bam2, input_bam1, input_bam2, peak_bed1, peak_bed2 = [], [], [], [], [], []
+    for s in SAMPLES:
+        ip_b1, ip_b2 = split_bam(s.ip_bam, os.path.join('consistency', f'{s.name}.ip.split.'), 2)
+        ip_bam1.append(ip_b1), ip_bam2.append(ip_b2)
+        input_b1, input_b2 = split_bam(s.input_bam, os.path.join('consistency', f'{s.name}.input.split.'), 2)
+        input_bam1.append(input_b1), input_bam2.append(input_b2)
+        bed1 = clipper_peaks(ip_b1, ip_b1.replace('.bam', '.peak.clusters.bed'))
+        bed2 = clipper_peaks(ip_b2, ip_b2.replace('.bam', '.peak.clusters.bed'))
+        peak_bed1.append(bed1), peak_bed2.append(bed2)
+
+    basename = ".vs.".join([os.path.basename(bam).replace('.bam', '') for bam in ip_bam1])
+    split_peak_bed1 = os.path.join('consistency', f'{basename}.reproducible.peaks.bed')
+    peak(ip_bam1, input_bam1, peak_bed1, split_peak_bed1, 'consistency')
+
+    basename = ".vs.".join([os.path.basename(bam).replace('.bam', '') for bam in ip_bam2])
+    split_peak_bed2 = os.path.join('consistency', f'{basename}.reproducible.peaks.bed')
+    peak(ip_bam2, input_bam2, peak_bed2, split_peak_bed2, 'consistency')
+
+    count1, count2 = count_lines(split_peak_bed1), count_lines(split_peak_bed2)
+    try:
+        ratio = count1 / count2
     except ZeroDivisionError:
         ratio = 0
         logger.error(f'No peaks found in one of the split reproducible peaks, return ratio 0.')
-    with open(outputs, 'w') as o:
+    with open(txt, 'w') as o:
         o.write(f'{ratio}\n')
+        
+        
+def find_motif():
+    extension = '.ip.peak.clusters.normalized.compressed.annotated.bed'
+    for bed in glob.iglob(f'*{extension}'):
+        exe = '/storage/vannostrand/software/motif/motif'
+        name = bed.replace(extension, '')
+        if len(glob.glob(f'{name}.motifs.*/*.homer.results.html')) >= 12:
+            logger.info(f'Motifs already identified for {bed}.')
+        else:
+            cmd = [exe, bed, options.species, options.outdir, name, options.l10p, options.l2fc, options.cpus]
+            cmder.run(cmd, msg=f'Finding motifs in {bed} ...')
+
+
+def parse_cutadapt_metrics(metrics):
+    reads, reads_too_short = 0, 0
+    with open(metrics) as f:
+        for line in f:
+            if ('Reads written (passing filters)' in line) or ('Pairs written (passing filters)' in line):
+                reads = int(line.strip().split()[-2].replace(',', ''))
+            elif ('Reads that were too short' in line) or ('Pairs that were too short' in line):
+                reads_too_short = int(line.strip().split()[-2].replace(',', ''))
+    return reads, reads_too_short
+
+
+def parse_star_log(log):
+    counts = []
+    with open(log) as f:
+        for line in f:
+            if 'Number of input reads' in line:
+                reads = int(line.strip().split('\t')[-1])
+            elif 'Uniquely mapped reads number' in line:
+                counts.append(int(line.strip().split('\t')[-1]))
+            elif 'Number of reads mapped to multiple loci' in line:
+                counts.append(int(line.strip().split('\t')[-1]))
+            elif 'Number of reads mapped to too many loci' in line:
+                counts.append(int(line.strip().split('\t')[-1]))
+            elif '% of reads unmapped: too many mismatches' in line:
+                counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
+            elif '% of reads unmapped: too short' in line:
+                counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
+            elif '% of reads unmapped: other' in line:
+                counts.append(int(float(line.strip().split('\t')[-1].replace('%', '')) * reads / 100))
+    return counts
+
+
+def get_usable_reads(bam1, bam2):
+    x = int(cmder.run(f'samtools view -c -F 0x4 {bam1}', msg='').stdout.read())
+    y = int(cmder.run(f'samtools view -c -F 0x4 {bam2}', msg='').stdout.read())
+    return [y, x - y]
+
+
+def count_bar_plot(data, data_type, tooltips, colors):
+    samples, categories = data['Samples'], [c for c in data.columns if c != 'Samples']
+    colors = colors[:len(categories)]
+    fig = figure(y_range=FactorRange(factors=samples[::-1]), plot_height=250, plot_width=1250,
+                 toolbar_location=None, tooltips=tooltips)
+    fig.add_layout(Legend(), 'right')
+    fig.hbar_stack(categories, y='Samples', height=0.8, color=colors, legend_label=categories,
+                   source=ColumnDataSource(data))
+    fig.x_range.start = 0
+    fig.x_range.range_padding = 0.1
+    formatter = NumeralTickFormatter(format="0 a") if data_type == 'counts' else NumeralTickFormatter(format="0%")
+    fig.xaxis[0].formatter = formatter
+    fig.xaxis.axis_label = 'Number of reads' if data_type == 'counts' else 'Percent of reads'
+    fig.xaxis.axis_line_color = None
+    fig.y_range.range_padding = 0.1
+    fig.yaxis.axis_line_color = None
+    fig.ygrid.grid_line_color = None
+    fig.legend.border_line_color = None
+    fig.axis.minor_tick_line_color = None
+    fig.axis.major_tick_line_color = None
+    fig.outline_line_color = None
+    return fig
+
+
+def count_percent_plot(counts, tooltips=None):
+    if tooltips:
+        count_tooltips, percent_tooltips = tooltips
+    else:
+        count_tooltips = [("Sample", "@Samples"), ("Unique Reads", "@{Unique Reads}{0.00 a}"),
+                          ("Duplicate Reads", "@{Duplicate Reads}{0.00 a}")]
+        percent_tooltips = [("Sample", "@Samples"), ("Unique Reads (%)", "@{Unique Reads}{0.00}"),
+                            ("Duplicate Reads (%)", "@{Duplicate Reads}{0.00}")]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b',
+              '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+    count_figure = count_bar_plot(counts, 'counts', count_tooltips, colors)
+    df = counts.copy()
+    df = df.set_index('Samples')
+    df = df.div(df.sum(axis=1), axis=0)
+    df = df.reset_index()
+    percent_figure = count_bar_plot(df, 'percent', percent_tooltips, colors)
+    
+    count_panel = Panel(child=count_figure, title='Count')
+    percent_panel = Panel(child=percent_figure, title='Percentage')
+    
+    tabs = Tabs(tabs=[count_panel, percent_panel])
+    script, div = components(tabs)
+    return script, div
+
+
+def peak_table_tabs():
+    ul = """<ul class="nav nav-pills" id="PeakClusterTab" role="tablist">
+    {lis}
+    </ul>
+    """
+    li = """<li class="nav-item" role="presentation">
+    <button class="nav-link border border-primary{active}" id="{tid}-tab" data-bs-toggle="pill" data-bs-target="#{tid}"
+    type="button" role="tab">{name}</button>
+    </li>
+    """
+    div = """<div class="tab-content" id="PeakClusterTabContent">
+    {divs}
+    </div>
+    """
+    lis, divs, table_ids = [], [], []
+    for i, name in enumerate(options.names):
+        tid = f'{name}.peak.clusters'.replace('.', '-')
+        table_ids.append(tid)
+        tsv = f'{name}.ip.peak.clusters.normalized.compressed.annotated.tsv'
+        columns = ['peak', 'ip_reads', 'input_reads', 'status', 'l10p', 'l2fc', 'gene']
+        df = pd.read_csv(tsv, sep='\t', usecols=columns)
+        df['peak'] = df['peak'].str.rsplit(':', expand=True, n=1)[0]
+        df = df[(df.l2fc >= 3) & (df.l10p >= 3)]
+        s = df.to_html(index=False, escape=True, table_id=f'{tid}-table', justify='center',
+                       classes='table table-bordered table-stripped table-responsive text-center')
+        if i == 0:
+            lis.append(li.format(tid=tid, active=' active', name=name))
+            divs.append(f'<div class="py-5 tab-pane fade show active" id="{tid}" role="tabpanel">{s}</div>')
+        else:
+            lis.append(li.format(tid=tid, active='', name=name))
+            divs.append(f'<div class="py-5 tab-pane fade" id="{tid}" role="tabpanel">{s}</div>')
+    s = ul.format(lis='\n'.join(lis)) + '\n' + div.format(divs='\n'.join(divs))
+    return s, table_ids
+
+
+def dt_js(table_ids):
+    s = """<script>
+        $(document).ready( function () {{
+            {tables}
+        }} );
+    </script>
+    """.format(tables='\n'.join([f"$('#{i}-table').DataTable();" for i in table_ids]))
+    return s
+
+
+@task(inputs=[], outputs=[f'{options.dataset}.report.html'], parent=consistency_ratio)
+def report(txt, out):
+    reads, cutadapt, repeat_map, genome_map, usable_reads = {}, [], [], [], []
+    for name in options.names:
+        for read in ('ip', 'input'):
+            sample = f'{name}.{read}'
+            n, x1 = parse_cutadapt_metrics(f'{sample}.trim.trim.trim.metrics')
+            _, x2 = parse_cutadapt_metrics(f'{sample}.trim.trim.metrics')
+            t, x3 = parse_cutadapt_metrics(f'{sample}.trim.metrics')
+            reads[f'{name}.{read}'] = t + x3
+            cutadapt.append([sample, n, x3, x2, x1])
+            repeat_map.append([sample] + parse_star_log(f'{sample}.repeat.map.log'))
+            genome_map.append([sample] + parse_star_log(f'{sample}.genome.map.log'))
+            usable_reads.append([sample] + get_usable_reads(f'{sample}.genome.map.bam', f'{sample}.bam'))
+    
+    dataset = []
+    for ip_fastq, input_fastq, name in zip(options.ip_fastqs, options.input_fastqs, options.names):
+        dataset.append([name, 'IP', ip_fastq, f"{reads[f'{name}.ip']:,}"])
+        dataset.append([name, 'INPUT', input_fastq, f"{reads[f'{name}.input']:,}"])
+    dataset = pd.DataFrame(dataset, columns=['Sample', 'Read', 'FASTQ', 'Reads'])
+    
+    columns = ['Samples', 'Reads written (passing filters)', 'Reads that were too short (round 1)',
+               'Reads that were too short (round 2)', 'Reads that were too short (round 3)']
+    cutadapt = pd.DataFrame(cutadapt, columns=columns)
+    count_tips = [("Sample", "@Samples"),
+                  ("# reads written (passing filters)", "@{Reads written (passing filters)}{0.00 a}"),
+                  ("# reads that were too short (round 1)", "@{Reads that were too short (round 1)}{0.00 a}"),
+                  ("# reads that were too short (round 2)", "@{Reads that were too short (round 2)}{0.00 a}"),
+                  ("# reads that were too short (round 3)", "@{Reads that were too short (round 3)}{0.00 a}")]
+    percent_tips = [("Sample", "@Samples"),
+                    ("% reads written (passing filters)", "@{Reads written (passing filters)}{0.00 a}"),
+                    ("% reads that were too short (round 1)", "@{Reads that were too short (round 1)}{0.00}"),
+                    ("% reads that were too short (round 2)", "@{Reads that were too short (round 2)}{0.00}"),
+                    ("% reads that were too short (round 3)", "@{Reads that were too short (round 3)}{0.00}")]
+    
+    scripts = []
+    script, cutadapt_div = count_percent_plot(cutadapt, tooltips=(count_tips, percent_tips))
+    scripts.append(script)
+    
+    columns = ['Samples', 'Uniquely mapped reads', 'Reads mapped to multiple loci',
+               'Reads mapped to too many loci', 'Reads unmapped: too many mismatches',
+               'Reads unmapped: too short', 'Reads unmapped: other']
+    count_tips = [("Sample", "@Samples"),
+                  ("# reads mapped uniquely", "@{Uniquely mapped reads}{0.00 a}"),
+                  ("# reads mapped to multiple loci (round 2)", "@{Reads mapped to multiple loci}{0.00 a}"),
+                  ("# reads mapped to too many loci", "@{Reads mapped to too many loci}{0.00 a}"),
+                  ("# reads unmapped: too many mismatches", "@{Reads unmapped: too many mismatches}{0.00 a}"),
+                  ("# reads unmapped: too short", "@{Reads unmapped: too short}{0.00 a}"),
+                  ("# reads unmapped: other", "@{Reads unmapped: other}{0.00 a}")]
+    percent_tips = [("Sample", "@Samples"),
+                    ("% reads mapped uniquely", "@{Uniquely mapped reads}{0.00}"),
+                    ("% reads mapped to multiple loci", "@{Reads mapped to multiple loci}{0.00}"),
+                    ("% reads mapped to too many loci", "@{Reads mapped to too many loci}{0.00}"),
+                    ("% reads unmapped: too many mismatches", "@{Reads unmapped: too many mismatches}{0.00}"),
+                    ("% reads unmapped: too short", "@{Reads unmapped: too short}{0.00}"),
+                    ("% reads unmapped: other", "@{Reads unmapped: other}{0.00}")]
+    repeat_map = pd.DataFrame(repeat_map, columns=columns)
+    script, repeat_map_div = count_percent_plot(repeat_map, tooltips=(count_tips, percent_tips))
+    scripts.append(script)
+    
+    genome_map = pd.DataFrame(genome_map, columns=columns)
+    script, genome_map_div = count_percent_plot(genome_map, tooltips=(count_tips, percent_tips))
+    scripts.append(script)
+    
+    usable_reads = pd.DataFrame(usable_reads, columns=['Samples', 'Usable Reads', 'Duplicated Reads'])
+    count_tips = [("Sample", "@Samples"),
+                  ("# usable reads", "@{Usable Reads}{0.00 a}"),
+                  ("# duplicated reads", "@{Duplicated Reads}{0.00 a}")]
+    percent_tips = [("Sample", "@Samples"),
+                    ("% usable reads", "@{Usable Reads}{0.00}"),
+                    ("% duplicated reads", "@{Duplicated Reads}{0.00}")]
+    script, usable_reads_div = count_percent_plot(usable_reads, tooltips=(count_tips, percent_tips))
+    scripts.append(script)
+    
+    peak_clusters, table_ids = peak_table_tabs()
+    template = '/storage/vannostrand/software/eclip/data/report.html'
+    data = {'dataset': dataset.to_html(index=False, escape=True, justify='center',
+                                       classes='table table-bordered table-stripped text-center'),
+            'cutadapt': cutadapt_div,
+            'repeat_map': repeat_map_div,
+            'genome_map': genome_map_div,
+            'usable_reads': usable_reads_div,
+            'peak_clusters': peak_clusters,
+            'peak_annotation': 'peak_annotation',
+            'reproducibility': 'reproducibility',
+            'scripts': '\n    '.join(scripts),
+            'data_table_js': dt_js(table_ids)
+            }
+    with open(template) as f, open(out, 'w') as o:
+        o.write(f.read().format(**data))
 
 
 def schedule():
@@ -500,6 +862,7 @@ def schedule():
 #SBATCH -t {runtime}                  # Runtime in D-HH:MM, minimum of 10 minutes
 #SBATCH --mem={memory}G                   # Memory pool for all cores (see also --mem-per-cpu)
 #SBATCH --job-name={job}            # Short name for the job
+#SBATCH --output=%j.{job}.log
 """
     sbatch_email = """
 #SBATCH --mail-user={email}
@@ -603,11 +966,13 @@ def main():
         logger.trace(f'\nRunning eCLIP using the following settings:\n\n{setting}\n')
         flow = Flow('eCLIP', description=__doc__.strip())
         flow.run(dry_run=options.dry_run, cpus=options.cpus)
+        # find_motif()
         logger.debug('')
         run_time = str(datetime.timedelta(seconds=int(time.perf_counter() - START_TIME)))
         logger.trace(FOOTER.format(hh_mm_ss=f'time consumed: {run_time}'.upper().center(118)))
 
 
 if __name__ == '__main__':
-    pass
     main()
+    # flow = Flow('eCLIP', description=__doc__.strip())
+    # flow.flow_chart('seclip.jpg')
