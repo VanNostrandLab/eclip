@@ -298,7 +298,7 @@ def dedup_bam(bam, out):
 def repetitive_elements_map(bam, tsv):
     cmd = ['repeat-maps', '--fastq', bam.replace('.genome.map.sort.bam', '.trim.fastq.gz'),
            '--bam', bam, '--dataset', bam.replace('.genome.map.sort.bam', ''), '--scheduler', 'local',
-           '--cpus', options.cpus, '--species', options.species, '--outdir', options.outdir]
+           '--cpus', options.cpus, '--species', options.species, '--outdir', options.outdir, '--debug']
     cmder.run(cmd, msg=f'Mapping {bam.replace(".genome.map.sort.bam", "")} repetitive elements ...')
 
 
@@ -492,7 +492,8 @@ def motif_analysis(bed, output):
         lis, divs, table_ids = [], [], []
         # for i, html in enumerate(glob.iglob(f'{name}.motifs.*/*.homer.results.html')):
         # print(glob.glob(f'{name}.motif*/*.html'))
-        for i, html in enumerate(glob.iglob(f'{name}.motif*/*.html')):
+        folder = f'{name}.motifs.40.min.plus.5p.20.3p.5'
+        for i, html in enumerate(glob.iglob(f'{folder}/*.html')):
             region = html.split('.')[-4]
             rid = 'region_' + region
             # print(f'Parsing motifs in {region} ...')
@@ -507,6 +508,7 @@ def motif_analysis(bed, output):
         template = '/storage/vannostrand/software/eclip/data/motif.template.html'
         with open(template) as f, open(output, 'w') as o:
             o.write(f.read().format(title=f'Motifs found in {name}', content=text))
+        cmder.run(f'zip {folder} -r {folder}/*')
             
     basename = output.split('.motifs.')[0]
     cmd = ['motif', bed, options.species, options.outdir, basename, options.l10p, options.l2fc, options.cpus]

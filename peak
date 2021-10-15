@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+unset PYTHONPATH
+export PATH="/storage/vannostrand/software/eclip/venv/bin:$PATH"
+
+if [[ "$*" == *--debug* ]]; then
+  export PATH="/storage/vannostrand/software/eclip/source:$PATH"
+  python /storage/vannostrand/software/eclip/source/peak.py "$@"
+else
+  python /storage/vannostrand/software/eclip/venv/bin/peak.py "$@"
+fi
