@@ -155,7 +155,8 @@ def soft_link(fastq, link):
     if path == os.path.abspath(link):
         logger.warning(f"No symbolic link was made for {path}! You are directly working on the original file!")
     else:
-        os.symlink(path, link)
+        if not os.path.islink(link):
+            os.symlink(path, link)
     return link
 
 
@@ -415,7 +416,10 @@ def pureclip(bam, bed):
            '-nt', options.cpus, '-ibam', input_bam, '-ibai', f'{input_bam}.bai', '-iv', f'"{refs};"',
            '-o', bed, '-or', bed.replace('.crosslink.sites.bed', '.binding.regions.bed'),
            '>', bed.replace('.crosslink.sites.bed', '.pureclip.log')]
-    cmder.run(cmd, msg=f'Calling peaks from {ip_bam} and {input_bam} using pureCLIP ...')
+    try:
+        cmder.run(cmd, msg=f'Calling peaks from {ip_bam} and {input_bam} using pureCLIP ...')
+    except Exception as e:
+        logger.error(f'Running pureclip failed: {e}.')
 
 
 def peak(ip_bams, input_bams, peak_beds, reproducible_bed, outdir):
@@ -442,23 +446,19 @@ def reproducible_peaks(inputs, outputs):
         peak_beds.append(sample.peak_bed)
         ids.append(sample.name)
     peak(ip_bams, input_bams, peak_beds, outputs, options.outdir)
-    
-    
-@task(inputs=reproducible_peaks,
-      outputs=lambda i: i.split('.annotated.reproducible.')[0] + '.motifs.40.min.plus.5p.20.3p.5.html'
-      if '.annotated.reproducible.' in i
-      else i.split('.ip.peak.clusters.')[0] + '.motifs.40.min.plus.5p.20.3p.5.html')
-def motif_analysis(bed, output):
+
+
+def compile_motif_html(name, output=''):
     def parse_motif_html(html):
         lines = []
-        with open(html) as f:
-            for line in f:
+        with open(html) as h:
+            for line in h:
                 if line.startswith('Total target sequences'):
                     lines.append(line)
                 elif line.startswith('Total background sequences'):
                     lines.append(line)
                     break
-            for line in f:
+            for line in h:
                 if line.startswith('</TABLE>'):
                     lines.append(line)
                     break
@@ -466,48 +466,55 @@ def motif_analysis(bed, output):
                     if '<BR/><A target=' in line:
                         line = line.split('<BR/><A target=')[0] + '</TD></TR>\n'
                     lines.append(line)
-        text = ''.join(lines).replace('<TD>Motif File</TD></TR>', '</TR>')
-        text = text.replace('border="1" cellpading="0" cellspacing="0"', f'class="text-center motif"')
-        text = text.replace('possible false positive</FONT><BR/>', 'possible false positive</FONT><BR/><BR/>')
-        text = text.replace('<TR><TD>Rank</TD>', '<thead><TR><TD>Rank</TD>')
-        text = text.replace('STD(Bg STD)', 'STD (Bg STD)')
-        text = text.replace('<TD>Best Match/Details</TD></TR>', '<TD>Best Match/Details</TD></TR></thead>')
-        return text
-
-    def compile_motif_html(name, output):
-        ul = """<ul class="nav nav-pills" id="MotifTab" role="tablist">
-        {lis}
-        </ul>
-        """
-        li = """<li class="nav-item mx-1 my-1" role="presentation">
-        <button class="nav-link border border-primary py-1{active}" id="{tid}-tab" data-bs-toggle="pill"
-        data-bs-target="#{tid}"
-        type="button" role="tab">{name}</button>
-        </li>
-        """
-        div = """<div class="tab-content" id="MotifTabContent">
-        {divs}
-        </div>
-        """
-        lis, divs, table_ids = [], [], []
-        folder = f'{name}.motifs.40.min.plus.5p.20.3p.5'
-        for i, html in enumerate(glob.iglob(f'{folder}/*.html')):
-            region = html.split('.')[-4]
-            rid = 'region_' + region
-            text = parse_motif_html(html)
-            if region == 'all':
-                lis.append(li.format(tid=rid, active=' active', name=region))
-                divs.append(f'<div class="py-3 tab-pane fade show active" id="{rid}" role="tabpanel">{text}</div>')
-            else:
-                lis.append(li.format(tid=rid, active='', name=region))
-                divs.append(f'<div class="py-5 tab-pane fade" id="{rid}" role="tabpanel">{text}</div>')
-        text = ul.format(lis='\n'.join(lis)) + '\n' + div.format(divs='\n'.join(divs))
-        template = '/storage/vannostrand/software/eclip/data/motif.template.html'
+        s = ''.join(lines).replace('<TD>Motif File</TD></TR>', '</TR>')
+        s = s.replace('border="1" cellpading="0" cellspacing="0"', f'class="text-center motif"')
+        s = s.replace('possible false positive</FONT><BR/>', 'possible false positive</FONT><BR/><BR/>')
+        s = s.replace('<TR><TD>Rank</TD>', '<thead><TR><TD>Rank</TD>')
+        s = s.replace('STD(Bg STD)', 'STD (Bg STD)')
+        s = s.replace('<TD>Best Match/Details</TD></TR>', '<TD>Best Match/Details</TD></TR></thead>')
+        return s
+    
+    ul = """<ul class="nav nav-pills" id="MotifTab" role="tablist">
+    {lis}
+    </ul>
+    """
+    li = """<li class="nav-item mx-1 my-1" role="presentation">
+    <button class="nav-link border border-primary py-1{active}" id="{tid}-tab" data-bs-toggle="pill"
+    data-bs-target="#{tid}"
+    type="button" role="tab">{name}</button>
+    </li>
+    """
+    div = """<div class="tab-content" id="MotifTabContent">
+    {divs}
+    </div>
+    """
+    lis, divs, table_ids = [], [], []
+    folder = f'{name}.motifs.40.min.plus.5p.20.3p.5'
+    for i, html in enumerate(glob.iglob(f'{folder}/*.html')):
+        region = html.split('.')[-4]
+        rid = 'region_' + region
+        text = parse_motif_html(html)
+        if region == 'all':
+            lis.append(li.format(tid=rid, active=' active', name=region))
+            divs.append(f'<div class="py-3 tab-pane fade show active" id="{rid}" role="tabpanel">{text}</div>')
+        else:
+            lis.append(li.format(tid=rid, active='', name=region))
+            divs.append(f'<div class="py-5 tab-pane fade" id="{rid}" role="tabpanel">{text}</div>')
+    text = ul.format(lis='\n'.join(lis)) + '\n' + div.format(divs='\n'.join(divs))
+    template = '/storage/vannostrand/software/eclip/data/motif.template.html'
+    if output:
         with open(template) as f, open(output, 'w') as o:
             o.write(f.read().format(title=f'Motifs found in {name}', content=text))
-        cmder.run(f'zip -r -q {folder}.zip {folder}/*')
-        cmder.run(f'rm -rf {folder}')
-            
+    return text
+    # cmder.run(f'zip -r -q {folder}.zip {folder}/*')
+    # cmder.run(f'rm -rf {folder}')
+    
+    
+@task(inputs=reproducible_peaks,
+      outputs=lambda i: i.split('.annotated.reproducible.')[0] + '.motifs.40.min.plus.5p.20.3p.5.html'
+      if '.annotated.reproducible.' in i
+      else i.split('.ip.peak.clusters.')[0] + '.motifs.40.min.plus.5p.20.3p.5.html')
+def motif_analysis(bed, output):
     basename = output.split('.motifs.')[0]
     cmd = ['motif', bed, options.species, options.outdir, basename, options.l10p, options.l2fc, options.cpus]
     cmder.run(cmd, msg=f'Finding motifs in {bed} ...')
@@ -552,7 +559,7 @@ def count_lines(file):
     return lines
 
 
-@task(inputs=[], outputs=[f'{options.dataset}.rescue.ratio.txt'], parent=reproducible_peaks, mkdir=['rescue'])
+# @task(inputs=[], outputs=[f'{options.dataset}.rescue.ratio.txt'], parent=reproducible_peaks, mkdir=['rescue'])
 def rescue_ratio(inputs, txt):
     if len(SAMPLES) == 1:
         logger.warning('No enough samples (n = 1 < 2) to calculate rescue ratio!')
@@ -584,7 +591,8 @@ def rescue_ratio(inputs, txt):
         o.write(f'{ratio}\n')
     
 
-@task(inputs=[], outputs=[f'{options.dataset}.consistency.ratio.txt'], parent=reproducible_peaks, mkdir=['consistency'])
+# @task(inputs=[], outputs=[f'{options.dataset}.consistency.ratio.txt'], parent=reproducible_peaks,
+# mkdir=['consistency'])
 def consistency_ratio(inputs, txt):
     if len(SAMPLES) == 1:
         logger.warning('No enough samples (n = 1 < 2) to calculate self-consistency ratio!')
@@ -710,7 +718,7 @@ def peak_table_tabs():
     {lis}
     </ul>
     """
-    li = """<li class="nav-item" role="presentation">
+    li = """<li class="nav-item mx-1 my-1" role="presentation">
     <button class="nav-link border border-primary{active}" id="{tid}-tab" data-bs-toggle="pill" data-bs-target="#{tid}"
     type="button" role="tab">{name}</button>
     </li>
@@ -750,7 +758,7 @@ def dt_js(table_ids):
     return s
 
 
-@task(inputs=[], outputs=[f'{options.dataset}.report.html'], parent=consistency_ratio)
+@task(inputs=[], outputs=[f'{options.dataset}.report.html'], parent=reproducible_peaks)
 def report(txt, out):
     reads, cutadapt, repeat_map, genome_map, usable_reads = {}, [], [], [], []
     for name in options.names:
@@ -842,7 +850,7 @@ def report(txt, out):
         o.write(f.read().format(**data))
         
       
-@task(inputs=[], outputs=['.log.metrics.zip'], parent=report)
+# @task(inputs=[], outputs=['.log.metrics.zip'], parent=report)
 def cleanup(inputs, output):
     cmder.run('rm *.umi.fastq.gz *.trim.fastq.gz *.unmap.fastq.gz || true')
     fastq_links = [p for p in glob.iglob("*.fastq.gz") if os.path.islink(p)]
