@@ -404,8 +404,8 @@ def clipper(bam, bed):
     return clipper_peaks(bam, bed)
 
 
-@task(inputs=[],
-      outputs=[sample.cross_bed for sample in SAMPLES], parent=dedup_bam)
+# @task(inputs=[],
+#       outputs=[sample.cross_bed for sample in SAMPLES], parent=dedup_bam)
 def pureclip(bam, bed):
     ip_bam, input_bam = [[sample.ip_bam, sample.input_bam] for sample in SAMPLES
                          if sample.cross_bed == bed][0]
